@@ -82,8 +82,9 @@ async function runInProcessTranscode(jobId: string, data: ConversionQueueJobData
       sampleRate: data.sampleRate,
     });
 
-    // 3. Complete job (serve locally via backend endpoint since S3 is offline)
-    const localDownloadUrl = `http://localhost:5000/api/jobs/${jobId}/download`;
+    // Complete job - serve via backend download endpoint
+    const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
+    const localDownloadUrl = `${backendUrl}/api/jobs/${jobId}/download`;
 
     await updateJobProgress(jobId, 100, 'COMPLETED', undefined, undefined, result.fileSize, result.duration);
     

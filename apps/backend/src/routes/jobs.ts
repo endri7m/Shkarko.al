@@ -231,7 +231,9 @@ router.get('/:id/progress', async (req: Request, res: Response) => {
   });
 
   // Write initial state
-  res.write(`data: ${JSON.stringify({ jobId, status: job.status, progress: job.progress, s3Url: job.s3Key ? `http://localhost:9000/sonicflow-bucket/${job.s3Key}` : undefined, errorMessage: job.errorMessage })}\n\n`);
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
+  const downloadUrl = job.s3Key ? `${backendUrl}/api/jobs/${jobId}/download` : undefined;
+  res.write(`data: ${JSON.stringify({ jobId, status: job.status, progress: job.progress, s3Url: downloadUrl, errorMessage: job.errorMessage })}\n\n`);
 
   if (job.status === 'COMPLETED' || job.status === 'FAILED') {
     return res.end();
