@@ -138,6 +138,20 @@ async function runInProcessTranscode(jobId: string, data: ConversionQueueJobData
 }
 
 /**
+ * Explicitly initialise the queue system. Called once at server startup.
+ * Logs the active mode so Railway logs confirm which path is taken.
+ */
+export function initQueue(): void {
+  const isRedisReady = redisConnection && redisConnection.status === 'ready';
+  if (useMemoryQueue || !isRedisReady) {
+    useMemoryQueue = true;
+    console.log('[Queue] Initialised in IN-PROCESS mode (no Redis). Jobs run inside the backend process.');
+  } else {
+    console.log('[Queue] Initialised in BULLMQ/REDIS mode.');
+  }
+}
+
+/**
  * Add an audio conversion task to the Redis/BullMQ queue, or run in-process if offline.
  */
 export async function addConversionJob(jobId: string, data: ConversionQueueJobData): Promise<void> {
