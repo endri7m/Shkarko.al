@@ -10,7 +10,6 @@ COPY apps/backend ./apps/backend
 
 # Install dependencies and compile TypeScript
 RUN npm ci
-RUN npm run build -w packages/shared
 RUN npm run build -w apps/backend
 
 # Stage 2: Production runner
@@ -35,10 +34,8 @@ COPY apps/backend/package*.json ./apps/backend/
 # Install only production dependencies
 RUN npm ci --omit=dev --workspace=packages/shared --workspace=apps/backend
 
-# Copy built outputs from compile stage
-COPY --from=builder /app/packages/shared/dist ./packages/shared/dist
-COPY --from=builder /app/packages/shared/types.js ./packages/shared/
-COPY --from=builder /app/packages/shared/types.d.ts ./packages/shared/
+# Copy shared package source and backend build output
+COPY --from=builder /app/packages/shared ./packages/shared
 COPY --from=builder /app/apps/backend/dist ./apps/backend/dist
 
 EXPOSE 8080
