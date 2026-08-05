@@ -111,13 +111,16 @@ interface YtDlpMetadata {
 }
 
 // ---------------------------------------------------------------------------
-// yt-dlp via spawn — no buffer limit
+// yt-dlp via spawn — no buffer limit, accepts explicit binary path
 // ---------------------------------------------------------------------------
-function runYtDlp(args: string[]): Promise<string> {
+function runYtDlp(args: string[], usePath = false): Promise<string> {
+  // If first arg is a path (usePath=true), it was prepended by caller
+  const bin = usePath ? args[0] : ytDlpPath;
+  const actualArgs = usePath ? args.slice(1) : args;
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
-    const proc = spawn('yt-dlp', args);
+    const proc = spawn(bin, actualArgs);
 
     proc.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
     proc.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
@@ -136,55 +139,6 @@ function runYtDlp(args: string[]): Promise<string> {
       }
     });
   });
-}
-
-async function extractMediaInfo(url: string): Promise<{ streamUrl: string; title: string; artist: string; thumbnailUrl: string | null }> {
-  // Use bestaudio only — never download video data
-  const audioFormat = 'bestaudio[ext=m4a]/bestaudio/best';
-  const baseArgs = [
-    '--no-warnings', '--quiet', '--no-progress',
-    '--extractor-args', 'youtube:player_client=ios,android',
-    '--user-agent', USER_AGENT,
-    '--referer', REFERER,
-    '--buffer-size', '16K',
-  ];
-
-  try {
-    // Metadata and stream URL in parallel
-    const [metaStdout, streamStdout] = await Promise.all([
-      runYtDlp(['-j', ...baseArgs, '-f', audioFormat, url]),
-      runYtDlp(['-g', ...baseArgs, '-f', audioFormat, url]),
-    ]);
-
-    let metadata: YtDlpMetadata = {};
-    try { metadata = JSON.parse(metaStdout.trim()); } catch {}
-
-    const streamUrl = streamStdout.trim();
-    if (!streamUrl) throw new Error('No direct stream URL resolved.');
-
-    return {
-      streamUrl,
-      title: metadata.title || 'Unknown Title',
-      artist: metadata.uploader || metadata.artist || 'Unknown Artist',
-      thumbnailUrl: metadata.thumbnail || null,
-    };
-  } catch (error: any) {
-    const e = (error.message || '').toString();
-    if (e.includes('is not installed')) throw error;
-    if (e.includes('HTTP Error 403') || e.includes('Forbidden'))
-      throw new Error('Access Forbidden: Ingestion blocked by the media provider (HTTP 403).');
-    if (e.includes('HTTP Error 429') || e.includes('Too Many Requests'))
-      throw new Error('Rate Limited: Too many requests sent to the provider (HTTP 429).');
-    if (e.includes('Sign in to confirm') || e.includes('confirm your age'))
-      throw new Error('Age-Restricted: Stream requires age verification.');
-    if (e.includes('Unsupported URL') || e.includes('Unsupported'))
-      throw new Error('Format Not Supported: Provider is not supported by the extractor.');
-    if (e.includes('timed out') || e.includes('timeout'))
-      throw new Error('Network Timeout: The provider took too long to respond.');
-    if (e.includes('Video unavailable') || e.includes('does not exist') || e.includes('not found'))
-      throw new Error('Invalid URL: Media is unavailable or has been deleted.');
-    throw new Error(`Media Extraction Failed: ${e || 'Unable to parse media stream'}`);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -229,54 +183,231 @@ function downloadThumbnail(url: string, jobId: string): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Main transcode function
+// Resolve yt-dlp binary path
+// ---------------------------------------------------------------------------
+function resolveYtDlpPath(): string {
+  const candidates = ['/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp'];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  try {
+    const r = execFileSync('which', ['yt-dlp']).toString().trim();
+    if (r) return r;
+  } catch {}
+  return 'yt-dlp';
+}
+
+const ytDlpPath = resolveYtDlpPath();
+console.log(`[yt-dlp] Binary path: ${ytDlpPath}`);
+async function fetchMetadata(url: string): Promise<YtDlpMetadata> {
+  try {
+    const stdout = await runYtDlp([
+      '-j',
+      '--no-warnings', '--quiet', '--no-progress',
+      '--extractor-args', 'youtube:player_client=ios,android',
+      '--user-agent', USER_AGENT,
+      '--referer', REFERER,
+      url,
+    ]);
+    try { return JSON.parse(stdout.trim()); } catch { return {}; }
+  } catch {
+    return {};
+  }
+}
+  const candidates = [
+    '/usr/local/bin/yt-dlp',
+    '/usr/bin/yt-dlp',
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  try {
+    const r = execFileSync('which', ['yt-dlp']).toString().trim();
+    if (r) return r;
+  } catch {}
+  return 'yt-dlp'; // fallback — hope it's on PATH
+}
+
+const ytDlpPath = resolveYtDlpPath();
+console.log(`[yt-dlp] Binary path: ${ytDlpPath}`);
+
+// ---------------------------------------------------------------------------
+// Fetch metadata only (title, artist, thumbnail) — separate from streaming
+// ---------------------------------------------------------------------------
+async function fetchMetadata(url: string): Promise<YtDlpMetadata> {
+  try {
+    const stdout = await runYtDlp([
+      ytDlpPath !== 'yt-dlp' ? ytDlpPath : 'yt-dlp',
+      '-j',
+      '--no-warnings', '--quiet', '--no-progress',
+      '--extractor-args', 'youtube:player_client=ios,android',
+      '--user-agent', USER_AGENT,
+      '--referer', REFERER,
+      url,
+    ], true);
+    try { return JSON.parse(stdout.trim()); } catch { return {}; }
+  } catch {
+    return {};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main transcode function — PIPE METHOD
+// yt-dlp streams audio → stdout → FFmpeg stdin
+// YouTube never sees FFmpeg's user-agent
 // ---------------------------------------------------------------------------
 export async function transcodeAudio(job: Job, options: TranscodeOptions): Promise<TranscodeResult> {
   const { jobId, sourceType, sourcePath, sourceUrl, bitrate, sampleRate } = options;
   const outputPath = path.join(CONVERTED_DIR, `${jobId}.mp3`);
 
-  let inputSource = sourceType === 'UPLOAD' ? sourcePath! : sourceUrl!;
-  let metadataTitle = sourceType === 'UPLOAD' && sourcePath ? path.basename(sourcePath) : '';
-  let metadataArtist = '';
+  // ---- UPLOAD path (unchanged) ----
+  if (sourceType === 'UPLOAD') {
+    if (!fs.existsSync(sourcePath!)) {
+      throw new Error(`Upload source file does not exist: ${sourcePath}`);
+    }
+    console.log(`[Processor] Starting ffmpeg for job: ${jobId} (UPLOAD)`);
+    return transcodeFromFile(job, jobId, sourcePath!, outputPath, bitrate, sampleRate, path.basename(sourcePath!), '', null, false);
+  }
+
+  // ---- URL path — pipe method ----
+  console.log(`[Processor] Starting yt-dlp pipe for job: ${jobId} | URL: ${sourceUrl}`);
+
+  // Fetch metadata in background — non-blocking, don't delay transcode start
+  let metadataTitle = 'Unknown Title';
+  let metadataArtist = 'Unknown Artist';
   let thumbnailPath: string | null = null;
-  let hasExtractedStream = false;
 
-  if (sourceType === 'URL') {
-    try {
-      console.log(`[Ingestion ${jobId}] Spawning extractor for: ${sourceUrl}`);
-      const extraction = await extractMediaInfo(sourceUrl!);
-      inputSource = extraction.streamUrl;
-      metadataTitle = extraction.title;
-      metadataArtist = extraction.artist;
-      hasExtractedStream = true;
-      if (extraction.thumbnailUrl) {
-        thumbnailPath = await downloadThumbnail(extraction.thumbnailUrl, jobId);
+  const metaPromise = fetchMetadata(sourceUrl!).then(async (meta) => {
+    metadataTitle = meta.title || 'Unknown Title';
+    metadataArtist = meta.uploader || meta.artist || 'Unknown Artist';
+    if (meta.thumbnail) {
+      thumbnailPath = await downloadThumbnail(meta.thumbnail, jobId);
+    }
+  }).catch(() => {});
+
+  // Spawn yt-dlp to pipe audio to stdout
+  const ytDlpArgs = [
+    '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+    '--no-warnings', '--no-progress',
+    '--extractor-args', 'youtube:player_client=ios,android',
+    '--user-agent', USER_AGENT,
+    '--referer', REFERER,
+    '--buffer-size', '16K',
+    '-o', '-',   // output to stdout
+    sourceUrl!,
+  ];
+
+  const ytDlpProc = spawn(ytDlpPath, ytDlpArgs);
+
+  const errChunks: Buffer[] = [];
+  ytDlpProc.stderr.on('data', (chunk: Buffer) => {
+    errChunks.push(chunk);
+    process.stdout.write(`[yt-dlp ${jobId}] ${chunk.toString()}`);
+  });
+
+  console.log(`[Processor] Starting ffmpeg for job: ${jobId} (PIPE)`);
+
+  // Wait for metadata (up to 8s) then transcode — metadata is embedded after
+  const transcodeResult = await new Promise<TranscodeResult>((resolve, reject) => {
+    let totalDuration = 0;
+    let ytDlpExited = false;
+    let ytDlpExitCode: number | null = null;
+
+    ytDlpProc.on('error', (err: any) => {
+      reject(err.code === 'ENOENT'
+        ? new Error('yt-dlp is not installed.')
+        : new Error(`yt-dlp spawn error: ${err.message}`));
+    });
+
+    ytDlpProc.on('close', (code) => {
+      ytDlpExited = true;
+      ytDlpExitCode = code;
+      if (code !== 0 && code !== null) {
+        const errMsg = Buffer.concat(errChunks).toString('utf8');
+        console.error(`[yt-dlp ${jobId}] Exited with code ${code}: ${errMsg}`);
       }
-    } catch (e: any) {
-      if (!sourceUrl!.match(/\.(mp3|wav|ogg|flac|m4a|aac)(\?|$)/i)) throw e;
-      console.log(`[Ingestion ${jobId}] Direct audio URL fallback.`);
-    }
+    });
+
+    // Feed yt-dlp stdout directly into FFmpeg via pipe:0
+    const command = ffmpeg()
+      .input(ytDlpProc.stdout as any)
+      .inputFormat('mp4')           // m4a/bestaudio container hint
+      .audioCodec('libmp3lame')
+      .audioBitrate(bitrate)
+      .audioFrequency(sampleRate)
+      .addOptions(['-threads', '0'])
+      .outputOptions(['-vn'])       // strip video/cover — add cover art after
+      .on('start', (cmdline) => {
+        console.log(`[FFmpeg Job ${jobId}] Command: ${cmdline}`);
+        console.log(`[FFmpeg] Process spawned successfully`);
+      })
+      .on('codecData', (data) => {
+        if (data.duration) {
+          totalDuration = parseDurationToSeconds(data.duration);
+          console.log(`[FFmpeg Job ${jobId}] Duration: ${totalDuration}s`);
+        }
+      })
+      .on('progress', async (progress) => {
+        let percent = 0;
+        if (progress.percent !== undefined && progress.percent > 0) {
+          percent = Math.round(progress.percent);
+        } else if (totalDuration > 0 && progress.timemark) {
+          percent = Math.round((parseDurationToSeconds(progress.timemark) / totalDuration) * 100);
+        }
+        percent = Math.max(1, Math.min(99, percent));
+        await job.updateProgress(percent).catch(() => {});
+        await publishJobProgress(jobId, 'PROCESSING', percent);
+      })
+      .on('end', () => {
+        console.log(`[FFmpeg Job ${jobId}] Transcoding complete.`);
+        try {
+          const stats = fs.statSync(outputPath);
+          ffmpeg.ffprobe(outputPath, (err, meta) => {
+            resolve({
+              outputPath,
+              duration: (!err && meta?.format?.duration) ? Math.round(meta.format.duration) : totalDuration,
+              fileSize: stats.size,
+              title: metadataTitle,
+            });
+          });
+        } catch (e) {
+          reject(new Error(`Failed to stat output: ${(e as Error).message}`));
+        }
+      })
+      .on('error', (err) => {
+        console.error(`[FFmpeg Job ${jobId}] Error: ${err.message}`);
+        // Kill yt-dlp if FFmpeg fails
+        try { ytDlpProc.kill(); } catch {}
+        reject(err);
+      })
+      .save(outputPath);
+  });
+
+  // Wait for metadata to finish loading before returning
+  await Promise.race([metaPromise, new Promise(r => setTimeout(r, 3000))]);
+
+  // Embed metadata + cover art into the finished MP3
+  if (metadataTitle !== 'Unknown Title' || thumbnailPath) {
+    await embedMetadata(outputPath, metadataTitle, metadataArtist, thumbnailPath);
   }
+  if (thumbnailPath && fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
 
-  if (sourceType === 'UPLOAD' && !fs.existsSync(inputSource)) {
-    throw new Error(`Upload source file does not exist: ${inputSource}`);
-  }
+  return { ...transcodeResult, title: metadataTitle };
+}
 
-  console.log(`[Processor] Starting ffmpeg for job: ${jobId}`);
+// ---------------------------------------------------------------------------
+// Embed ID3 metadata + cover art into an existing MP3 (post-transcode)
+// ---------------------------------------------------------------------------
+function embedMetadata(
+  filePath: string,
+  title: string,
+  artist: string,
+  thumbnailPath: string | null
+): Promise<void> {
+  return new Promise((resolve) => {
+    const tmpPath = filePath + '.meta.mp3';
+    let command = ffmpeg(filePath).audioCodec('copy');
 
-  return new Promise((resolve, reject) => {
-    let command = ffmpeg(inputSource);
-
-    // Network stream resilience
-    if (sourceType === 'URL') {
-      command = command.inputOptions([
-        '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '5',
-      ]);
-    }
-
-    // Cover art embedding
     if (thumbnailPath && fs.existsSync(thumbnailPath)) {
       command = command
         .input(thumbnailPath)
@@ -287,49 +418,78 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
         ]);
     }
 
-    // ID3 metadata tags
-    if (hasExtractedStream) {
-      command = command.outputOptions([
-        '-metadata', `title=${metadataTitle}`,
-        '-metadata', `artist=${metadataArtist}`,
-        '-id3v2_version', '3',
-        '-metadata:s:v', 'title=Album cover',
-        '-metadata:s:v', 'comment=Cover (front)',
-      ]);
-    }
-
-    let totalDuration = 0;
-
     command
+      .outputOptions([
+        '-metadata', `title=${title}`,
+        '-metadata', `artist=${artist}`,
+        '-id3v2_version', '3',
+      ])
+      .on('end', () => {
+        try {
+          fs.renameSync(tmpPath, filePath);
+        } catch {}
+        resolve();
+      })
+      .on('error', () => {
+        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch {}
+        resolve(); // non-fatal — file already transcoded
+      })
+      .save(tmpPath);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Transcode from a local file path (UPLOAD flow)
+// ---------------------------------------------------------------------------
+function transcodeFromFile(
+  job: Job,
+  jobId: string,
+  inputPath: string,
+  outputPath: string,
+  bitrate: number,
+  sampleRate: number,
+  title: string,
+  artist: string,
+  thumbnailPath: string | null,
+  hasMetadata: boolean
+): Promise<TranscodeResult> {
+  return new Promise((resolve, reject) => {
+    let totalDuration = 0;
+    let command = ffmpeg(inputPath)
       .audioCodec('libmp3lame')
       .audioBitrate(bitrate)
       .audioFrequency(sampleRate)
-      // Speed optimisations: use all CPU cores, fastest encode preset
-      .addOptions(['-threads', '0'])
-      .on('start', (cmdline) => {
-        console.log(`[FFmpeg Job ${jobId}] Command: ${cmdline}`);
-      })
+      .addOptions(['-threads', '0']);
+
+    if (thumbnailPath && fs.existsSync(thumbnailPath)) {
+      command = command.input(thumbnailPath)
+        .outputOptions(['-map', '0:a', '-map', '1:v', '-disposition:v:0', 'attached_pic']);
+    }
+    if (hasMetadata) {
+      command = command.outputOptions([
+        '-metadata', `title=${title}`,
+        '-metadata', `artist=${artist}`,
+        '-id3v2_version', '3',
+      ]);
+    }
+
+    command
+      .on('start', (cmd) => console.log(`[FFmpeg Job ${jobId}] Command: ${cmd}`))
       .on('codecData', (data) => {
-        if (data.duration) {
-          totalDuration = parseDurationToSeconds(data.duration);
-          console.log(`[FFmpeg Job ${jobId}] Duration: ${totalDuration}s`);
-        }
+        if (data.duration) totalDuration = parseDurationToSeconds(data.duration);
       })
       .on('progress', async (progress) => {
-        let percent = 0;
-        if (progress.percent !== undefined) {
-          percent = Math.round(progress.percent);
-        } else if (totalDuration > 0 && progress.timemark) {
-          percent = Math.round((parseDurationToSeconds(progress.timemark) / totalDuration) * 100);
-        }
-        percent = Math.max(1, Math.min(99, percent)); // always show at least 1% once started
-        await job.updateProgress(percent);
+        let percent = progress.percent !== undefined
+          ? Math.round(progress.percent)
+          : totalDuration > 0 && progress.timemark
+            ? Math.round((parseDurationToSeconds(progress.timemark) / totalDuration) * 100)
+            : 0;
+        percent = Math.max(1, Math.min(99, percent));
+        await job.updateProgress(percent).catch(() => {});
         await publishJobProgress(jobId, 'PROCESSING', percent);
       })
       .on('end', () => {
-        console.log(`[FFmpeg Job ${jobId}] Transcoding complete.`);
         if (thumbnailPath && fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
-
         try {
           const stats = fs.statSync(outputPath);
           ffmpeg.ffprobe(outputPath, (err, meta) => {
@@ -337,15 +497,15 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
               outputPath,
               duration: (!err && meta?.format?.duration) ? Math.round(meta.format.duration) : totalDuration,
               fileSize: stats.size,
-              title: metadataTitle || 'Converted Audio',
+              title,
             });
           });
         } catch (e) {
-          reject(new Error(`Failed to stat output file: ${(e as Error).message}`));
+          reject(new Error(`Failed to stat output: ${(e as Error).message}`));
         }
       })
       .on('error', (err) => {
-        console.error(`[FFmpeg Job ${jobId}] Error:`, err.message);
+        console.error(`[FFmpeg Job ${jobId}] Error: ${err.message}`);
         if (thumbnailPath && fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
         reject(err);
       })
