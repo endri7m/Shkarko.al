@@ -1,0 +1,30 @@
+# Environment variables - NEVER commit these
+.env
+.env.local
+.env.production
+apps/backend/.env
+apps/frontend/.env
+apps/worker/.env
+
+# Dependencies
+node_modules/
+.node/
+
+# Build outputs
+dist/
+.next/
+apps/frontend/.next/
+apps/backend/dist/
+apps/worker/dist/
+apps/frontend/tsconfig.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+/tmp/
