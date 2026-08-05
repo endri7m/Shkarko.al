@@ -17,7 +17,23 @@ if (ffmpegStatic) {
 const execFileAsync = promisify(execFile);
 
 const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-const redisPublisher = new IORedis(redisUrl);
+
+let redisPublisher: any = null;
+
+function getRedisPublisher() {
+  if (!redisPublisher) {
+    try {
+      redisPublisher = new IORedis(redisUrl, { 
+        lazyConnect: true,
+        enableOfflineQueue: false,
+      });
+      redisPublisher.on('error', () => {}); // Silently ignore errors
+    } catch {
+      // Invalid URL or connection failure — ignore
+    }
+  }
+  return redisPublisher;
+}
 
 // Ensure scratch conversion folder exists
 const SCRATCH_DIR = '/tmp/sonicflow-scratch';
@@ -61,14 +77,15 @@ export async function publishJobProgress(
   progress: number,
   extra: { s3Url?: string; errorMessage?: string; fileSize?: number; duration?: number } = {}
 ): Promise<void> {
-  const channel = `job-progress:${jobId}`;
-  const payload = {
-    jobId,
-    status,
-    progress,
-    ...extra,
-  };
-  await redisPublisher.publish(channel, JSON.stringify(payload));
+  try {
+    const pub = getRedisPublisher();
+    if (!pub) return;
+    const channel = `job-progress:${jobId}`;
+    const payload = { jobId, status, progress, ...extra };
+    await pub.publish(channel, JSON.stringify(payload));
+  } catch {
+    // Fail silently when Redis is offline
+  }
 }
 
 /**

@@ -12,10 +12,17 @@ dotenv.config();
 const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
 const databaseUrl = process.env.DATABASE_URL || 'postgresql://sonicflow_user:sonicflow_password@localhost:5432/sonicflow?sslmode=disable';
 
-// Setup Redis connection for Worker
-const redisConnection = new IORedis(redisUrl, {
-  maxRetriesPerRequest: null,
-});
+// Setup Redis connection for Worker - exit gracefully if Redis not available
+let redisConnection: any;
+try {
+  redisConnection = new IORedis(redisUrl, {
+    maxRetriesPerRequest: null,
+    enableOfflineQueue: false,
+  });
+} catch (err) {
+  console.warn('[Worker] Redis URL is invalid or not configured. Worker will exit.');
+  process.exit(0);
+}
 
 /**
  * Direct Postgres Client to update job logs in DB
