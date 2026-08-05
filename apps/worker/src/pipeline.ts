@@ -5,16 +5,13 @@ import path from 'path';
 import IORedis from 'ioredis';
 import { Job } from 'bullmq';
 import { JobStatus } from '@sonicflow/shared';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
+import { spawn } from 'child_process';
 import http from 'http';
 import https from 'https';
 
 if (ffmpegStatic) {
   ffmpeg.setFfmpegPath(ffmpegStatic);
 }
-
-const execFileAsync = promisify(execFile);
 
 const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
 
@@ -23,11 +20,11 @@ let redisPublisher: any = null;
 function getRedisPublisher() {
   if (!redisPublisher) {
     try {
-      redisPublisher = new IORedis(redisUrl, { 
+      redisPublisher = new IORedis(redisUrl, {
         lazyConnect: true,
         enableOfflineQueue: false,
       });
-      redisPublisher.on('error', () => {}); // Silently ignore errors
+      redisPublisher.on('error', () => {});
     } catch {
       // Invalid URL or connection failure — ignore
     }
@@ -56,8 +53,8 @@ interface TranscodeOptions {
 
 interface TranscodeResult {
   outputPath: string;
-  duration: number; // in seconds
-  fileSize: number; // in bytes
+  duration: number;
+  fileSize: number;
   title: string;
 }
 
@@ -66,6 +63,106 @@ interface YtDlpMetadata {
   uploader?: string;
   artist?: string;
   thumbnail?: string;
+}
+
+/**
+ * Runs yt-dlp using spawn and collects stdout as a stream to avoid maxBuffer issues.
+ */
+function runYtDlp(args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+
+    const proc = spawn('yt-dlp', args);
+
+    proc.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+    proc.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
+
+    proc.on('error', (err: any) => {
+      if (err.code === 'ENOENT') {
+        reject(new Error('Media Extractor (yt-dlp) is not installed on this host system.'));
+      } else {
+        reject(err);
+      }
+    });
+
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        const errOutput = Buffer.concat(errChunks).toString('utf8');
+        reject(new Error(errOutput || `yt-dlp exited with code ${code}`));
+      } else {
+        resolve(Buffer.concat(chunks).toString('utf8'));
+      }
+    });
+  });
+}
+
+/**
+ * Invokes yt-dlp via spawn to extract stream info, metadata, and thumbnail.
+ */
+async function extractMediaInfo(url: string): Promise<{ streamUrl: string; title: string; artist: string; thumbnailUrl: string | null }> {
+  try {
+    const metaStdout = await runYtDlp([
+      '-j',
+      '--no-warnings',
+      '--quiet',
+      '--no-progress',
+      '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+      '--extractor-args', 'youtube:player_client=ios,android',
+      '--user-agent', USER_AGENT,
+      '--referer', REFERER,
+      url,
+    ]);
+
+    let metadata: YtDlpMetadata = {};
+    try {
+      metadata = JSON.parse(metaStdout.trim()) as YtDlpMetadata;
+    } catch {
+      // Metadata parse failed — continue with empty metadata
+    }
+
+    const streamStdout = await runYtDlp([
+      '-g',
+      '--no-warnings',
+      '--quiet',
+      '--no-progress',
+      '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+      '--extractor-args', 'youtube:player_client=ios,android',
+      '--user-agent', USER_AGENT,
+      '--referer', REFERER,
+      url,
+    ]);
+
+    const streamUrl = streamStdout.trim();
+    if (!streamUrl) {
+      throw new Error('No direct stream URL resolved.');
+    }
+
+    return {
+      streamUrl,
+      title: metadata.title || 'Unknown Title',
+      artist: metadata.uploader || metadata.artist || 'Unknown Artist',
+      thumbnailUrl: metadata.thumbnail || null,
+    };
+  } catch (error: any) {
+    const errorStr = (error.message || '').toString();
+
+    if (errorStr.includes('is not installed')) throw error;
+    if (errorStr.includes('HTTP Error 403') || errorStr.includes('Forbidden'))
+      throw new Error('Access Forbidden: Ingestion blocked by the media provider (HTTP 403).');
+    if (errorStr.includes('HTTP Error 429') || errorStr.includes('Too Many Requests'))
+      throw new Error('Rate Limited: Too many requests sent to the provider (HTTP 429).');
+    if (errorStr.includes('Sign in to confirm your age') || errorStr.includes('confirm your age'))
+      throw new Error('Age-Restricted: Stream requires age verification and cannot be ingested.');
+    if (errorStr.includes('Unsupported URL') || errorStr.includes('Unsupported'))
+      throw new Error('Format Not Supported: Provider is not supported by the extractor.');
+    if (errorStr.includes('timed out') || errorStr.includes('timeout'))
+      throw new Error('Network Timeout: The provider took too long to respond.');
+    if (errorStr.includes('Video unavailable') || errorStr.includes('does not exist') || errorStr.includes('not found'))
+      throw new Error('Invalid URL: Media is unavailable or has been deleted.');
+
+    throw new Error(`Media Extraction Failed: ${errorStr || 'Unable to parse media stream'}`);
+  }
 }
 
 /**
@@ -112,9 +209,7 @@ function downloadThumbnail(url: string, jobId: string): Promise<string | null> {
       });
     }).on('error', (err) => {
       file.close();
-      if (fs.existsSync(outputPath)) {
-        fs.unlinkSync(outputPath);
-      }
+      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
       console.error('[Thumbnail Download] Error:', err);
       resolve(null);
     });
@@ -122,75 +217,7 @@ function downloadThumbnail(url: string, jobId: string): Promise<string | null> {
 }
 
 /**
- * Invokes yt-dlp to extract stream info, metadata, and thumbnail.
- */
-async function extractMediaInfo(url: string): Promise<{ streamUrl: string; title: string; artist: string; thumbnailUrl: string | null }> {
-  try {
-    // 1. Fetch metadata JSON
-    const { stdout: metaStdout } = await execFileAsync('yt-dlp', [
-      '-j',
-      '-f', 'bestaudio[ext=m4a]/bestaudio/18/best',
-      '--extractor-args', 'youtube:player_client=ios,android',
-      '--no-warnings',
-      '--user-agent', USER_AGENT,
-      '--referer', REFERER,
-      url
-    ]);
-    const metadata = JSON.parse(metaStdout) as YtDlpMetadata;
-
-    // 2. Fetch direct audio stream URL
-    const { stdout: streamStdout } = await execFileAsync('yt-dlp', [
-      '-g',
-      '-f', 'bestaudio[ext=m4a]/bestaudio/18/best',
-      '--extractor-args', 'youtube:player_client=ios,android',
-      '--no-warnings',
-      '--user-agent', USER_AGENT,
-      '--referer', REFERER,
-      url
-    ]);
-
-    const streamUrl = streamStdout.trim();
-    if (!streamUrl) {
-      throw new Error('No direct stream URL resolved.');
-    }
-
-    const title = metadata.title || 'Unknown Title';
-    const artist = metadata.uploader || metadata.artist || 'Unknown Artist';
-    const thumbnailUrl = metadata.thumbnail || null;
-
-    return { streamUrl, title, artist, thumbnailUrl };
-  } catch (error: any) {
-    if (error.code === 'ENOENT') {
-      throw new Error('Media Extractor (yt-dlp) is not installed on this host system. Please run in Docker or install yt-dlp locally.');
-    }
-
-    const errorStr = (error.message || '').toString();
-    
-    if (errorStr.includes('HTTP Error 403') || errorStr.includes('Forbidden')) {
-      throw new Error('Access Forbidden: Ingestion blocked by the media provider (HTTP 403).');
-    }
-    if (errorStr.includes('HTTP Error 429') || errorStr.includes('Too Many Requests')) {
-      throw new Error('Rate Limited: Too many requests sent to the provider (HTTP 429).');
-    }
-    if (errorStr.includes('Sign in to confirm your age') || errorStr.includes('confirm your age')) {
-      throw new Error('Age-Restricted: Stream requires age verification and cannot be ingested.');
-    }
-    if (errorStr.includes('Unsupported URL') || errorStr.includes('Unsupported')) {
-      throw new Error('Format Not Supported: Provider is not supported by the extractor.');
-    }
-    if (errorStr.includes('timed out') || errorStr.includes('timeout')) {
-      throw new Error('Network Timeout: The provider took too long to respond.');
-    }
-    if (errorStr.includes('Video unavailable') || errorStr.includes('does not exist') || errorStr.includes('not found')) {
-      throw new Error('Invalid URL: Media is unavailable or has been deleted.');
-    }
-
-    throw new Error(`Media Extraction Failed: ${error.message || 'Unable to parse media stream'}`);
-  }
-}
-
-/**
- * Run FFmpeg transcode pipeline with stream piping or native remote-reading.
+ * Run FFmpeg transcode pipeline.
  */
 export async function transcodeAudio(
   job: Job,
