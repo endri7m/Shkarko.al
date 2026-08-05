@@ -18,8 +18,14 @@ FROM node:20-alpine AS runner
 
 WORKDIR /app
 
-# Install ffmpeg, python3, and yt-dlp for in-process transcoding fallback
-RUN apk add --no-cache ffmpeg python3 yt-dlp
+# Install ffmpeg, python3, pip, and yt-dlp
+RUN apk add --no-cache \
+    ffmpeg \
+    python3 \
+    py3-pip \
+    curl \
+  && pip3 install --no-cache-dir --break-system-packages yt-dlp \
+  && yt-dlp --version
 
 # Copy package configurations
 COPY package*.json ./
