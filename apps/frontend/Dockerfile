@@ -8,8 +8,9 @@ COPY package*.json tsconfig.json ./
 COPY packages/shared ./packages/shared
 COPY apps/frontend ./apps/frontend
 
-# Set public variables for compiler client ingestion
-ENV NEXT_PUBLIC_API_URL=http://localhost:5000
+# Set public variables for compiler client ingestion (override with Railway URL at build time)
+ARG NEXT_PUBLIC_API_URL=http://localhost:5000
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 
 # Install dependencies and compile Next.js
 RUN npm ci
