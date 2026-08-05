@@ -35,10 +35,9 @@ COPY --from=builder /app/packages/shared/types.js ./packages/shared/
 COPY --from=builder /app/packages/shared/types.d.ts ./packages/shared/
 COPY --from=builder /app/apps/backend/dist ./apps/backend/dist
 
-EXPOSE 5000
+EXPOSE 8080
 
 ENV NODE_ENV=production
-ENV PORT=5000
 
 # Run API Server
 CMD ["node", "apps/backend/dist/index.js"]

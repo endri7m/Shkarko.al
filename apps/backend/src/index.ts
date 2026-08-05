@@ -33,6 +33,11 @@ app.get('/health', (req: Request, res: Response) => {
   res.json({ status: 'healthy', timestamp: new Date() });
 });
 
+// Root route - confirms server is reachable
+app.get('/', (req: Request, res: Response) => {
+  res.json({ status: 'Server is running', version: '1.0.0' });
+});
+
 // Global Error Handling Middleware (Enterprise boundary)
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
   console.error('Unhandled Server Error:', err);
@@ -51,8 +56,8 @@ async function startServer() {
   try {
     await initDatabase();
     
-    app.listen(port, () => {
-      console.log(`[SonicFlow Backend] API Server listening on port ${port}`);
+    app.listen(Number(port), '0.0.0.0', () => {
+      console.log(`[SonicFlow Backend] API Server listening on 0.0.0.0:${port}`);
     });
   } catch (error) {
     console.error('Fatal: Server startup failed due to database connection issue:', error);
