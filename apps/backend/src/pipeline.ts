@@ -10,11 +10,9 @@ import http from 'http';
 import https from 'https';
 
 // ---------------------------------------------------------------------------
-// FFmpeg path resolution — prefer system ffmpeg on Linux (Railway/Docker),
-// fall back to ffmpeg-static for local dev on other platforms.
+// FFmpeg path resolution
 // ---------------------------------------------------------------------------
 function resolveFfmpegPath(): string {
-  // 1. Try system ffmpeg (installed via apk in Dockerfile)
   const systemPaths = ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'];
   for (const p of systemPaths) {
     if (fs.existsSync(p)) {
@@ -22,20 +20,15 @@ function resolveFfmpegPath(): string {
       return p;
     }
   }
-  // 2. Try which/where as fallback
   try {
     const result = execFileSync('which', ['ffmpeg']).toString().trim();
-    if (result) {
-      console.log(`[FFmpeg] Found ffmpeg via which: ${result}`);
-      return result;
-    }
+    if (result) { console.log(`[FFmpeg] Found via which: ${result}`); return result; }
   } catch {}
-  // 3. Fall back to ffmpeg-static (local dev)
   if (ffmpegStatic) {
     console.log(`[FFmpeg] Using ffmpeg-static: ${ffmpegStatic}`);
     return ffmpegStatic;
   }
-  throw new Error('FFmpeg binary not found. Install ffmpeg or ffmpeg-static.');
+  throw new Error('FFmpeg binary not found.');
 }
 
 function resolveFfprobePath(): string {
@@ -47,21 +40,36 @@ function resolveFfprobePath(): string {
     const result = execFileSync('which', ['ffprobe']).toString().trim();
     if (result) return result;
   } catch {}
-  return 'ffprobe'; // hope it's on PATH
+  return 'ffprobe';
+}
+
+function resolveYtDlpPath(): string {
+  const candidates = ['/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp'];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  try {
+    const r = execFileSync('which', ['yt-dlp']).toString().trim();
+    if (r) return r;
+  } catch {}
+  return 'yt-dlp';
 }
 
 const ffmpegPath = resolveFfmpegPath();
 const ffprobePath = resolveFfprobePath();
+const ytDlpPath = resolveYtDlpPath();
+
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
-console.log(`[FFmpeg] ffprobe path: ${ffprobePath}`);
+console.log(`[FFmpeg] ffprobe: ${ffprobePath}`);
+console.log(`[yt-dlp] Binary: ${ytDlpPath}`);
 
 // ---------------------------------------------------------------------------
 // Redis publisher — lazy, silent failures
 // ---------------------------------------------------------------------------
 const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-
 let redisPublisher: any = null;
+
 function getRedisPublisher() {
   if (!redisPublisher) {
     try {
@@ -111,23 +119,20 @@ interface YtDlpMetadata {
 }
 
 // ---------------------------------------------------------------------------
-// yt-dlp via spawn — no buffer limit, accepts explicit binary path
+// yt-dlp metadata fetch (text output only, no streaming)
 // ---------------------------------------------------------------------------
-function runYtDlp(args: string[], usePath = false): Promise<string> {
-  // If first arg is a path (usePath=true), it was prepended by caller
-  const bin = usePath ? args[0] : ytDlpPath;
-  const actualArgs = usePath ? args.slice(1) : args;
+function runYtDlpText(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
-    const proc = spawn(bin, actualArgs);
+    const proc = spawn(ytDlpPath, args);
 
     proc.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
     proc.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
 
     proc.on('error', (err: any) => {
       reject(err.code === 'ENOENT'
-        ? new Error('Media Extractor (yt-dlp) is not installed on this host system.')
+        ? new Error('yt-dlp is not installed.')
         : err);
     });
 
@@ -139,6 +144,22 @@ function runYtDlp(args: string[], usePath = false): Promise<string> {
       }
     });
   });
+}
+
+async function fetchMetadata(url: string): Promise<YtDlpMetadata> {
+  try {
+    const stdout = await runYtDlpText([
+      '-j',
+      '--no-warnings', '--quiet', '--no-progress',
+      '--extractor-args', 'youtube:player_client=ios,android',
+      '--user-agent', USER_AGENT,
+      '--referer', REFERER,
+      url,
+    ]);
+    try { return JSON.parse(stdout.trim()); } catch { return {}; }
+  } catch {
+    return {};
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -183,96 +204,137 @@ function downloadThumbnail(url: string, jobId: string): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Resolve yt-dlp binary path
+// Duration string → seconds
 // ---------------------------------------------------------------------------
-function resolveYtDlpPath(): string {
-  const candidates = ['/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp'];
-  for (const p of candidates) {
-    if (fs.existsSync(p)) return p;
-  }
+function parseDurationToSeconds(durationStr: string): number {
   try {
-    const r = execFileSync('which', ['yt-dlp']).toString().trim();
-    if (r) return r;
-  } catch {}
-  return 'yt-dlp';
-}
-
-const ytDlpPath = resolveYtDlpPath();
-console.log(`[yt-dlp] Binary path: ${ytDlpPath}`);
-async function fetchMetadata(url: string): Promise<YtDlpMetadata> {
-  try {
-    const stdout = await runYtDlp([
-      '-j',
-      '--no-warnings', '--quiet', '--no-progress',
-      '--extractor-args', 'youtube:player_client=ios,android',
-      '--user-agent', USER_AGENT,
-      '--referer', REFERER,
-      url,
-    ]);
-    try { return JSON.parse(stdout.trim()); } catch { return {}; }
-  } catch {
-    return {};
-  }
-}
-  const candidates = [
-    '/usr/local/bin/yt-dlp',
-    '/usr/bin/yt-dlp',
-  ];
-  for (const p of candidates) {
-    if (fs.existsSync(p)) return p;
-  }
-  try {
-    const r = execFileSync('which', ['yt-dlp']).toString().trim();
-    if (r) return r;
-  } catch {}
-  return 'yt-dlp'; // fallback — hope it's on PATH
-}
-
-const ytDlpPath = resolveYtDlpPath();
-console.log(`[yt-dlp] Binary path: ${ytDlpPath}`);
-
-// ---------------------------------------------------------------------------
-// Fetch metadata only (title, artist, thumbnail) — separate from streaming
-// ---------------------------------------------------------------------------
-async function fetchMetadata(url: string): Promise<YtDlpMetadata> {
-  try {
-    const stdout = await runYtDlp([
-      ytDlpPath !== 'yt-dlp' ? ytDlpPath : 'yt-dlp',
-      '-j',
-      '--no-warnings', '--quiet', '--no-progress',
-      '--extractor-args', 'youtube:player_client=ios,android',
-      '--user-agent', USER_AGENT,
-      '--referer', REFERER,
-      url,
-    ], true);
-    try { return JSON.parse(stdout.trim()); } catch { return {}; }
-  } catch {
-    return {};
-  }
+    const parts = durationStr.split(':');
+    if (parts.length === 3) {
+      return parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
+    }
+    return parseFloat(durationStr) || 0;
+  } catch { return 0; }
 }
 
 // ---------------------------------------------------------------------------
-// Main transcode function — PIPE METHOD
-// yt-dlp streams audio → stdout → FFmpeg stdin
-// YouTube never sees FFmpeg's user-agent
+// Embed ID3 metadata + cover art into finished MP3 (post-transcode, copy codec)
+// ---------------------------------------------------------------------------
+function embedMetadata(
+  filePath: string,
+  title: string,
+  artist: string,
+  thumbnailPath: string | null
+): Promise<void> {
+  return new Promise((resolve) => {
+    const tmpPath = filePath + '.meta.mp3';
+    let command = ffmpeg(filePath).audioCodec('copy');
+
+    if (thumbnailPath && fs.existsSync(thumbnailPath)) {
+      command = command
+        .input(thumbnailPath)
+        .outputOptions([
+          '-map', '0:a',
+          '-map', '1:v',
+          '-disposition:v:0', 'attached_pic',
+        ]);
+    }
+
+    command
+      .outputOptions([
+        '-metadata', `title=${title}`,
+        '-metadata', `artist=${artist}`,
+        '-id3v2_version', '3',
+      ])
+      .on('end', () => {
+        try { fs.renameSync(tmpPath, filePath); } catch {}
+        resolve();
+      })
+      .on('error', () => {
+        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch {}
+        resolve(); // non-fatal
+      })
+      .save(tmpPath);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Transcode from local file (UPLOAD flow)
+// ---------------------------------------------------------------------------
+function transcodeFromFile(
+  job: Job,
+  jobId: string,
+  inputPath: string,
+  outputPath: string,
+  bitrate: number,
+  sampleRate: number,
+  title: string
+): Promise<TranscodeResult> {
+  return new Promise((resolve, reject) => {
+    let totalDuration = 0;
+
+    ffmpeg(inputPath)
+      .audioCodec('libmp3lame')
+      .audioBitrate(bitrate)
+      .audioFrequency(sampleRate)
+      .addOptions(['-threads', '0'])
+      .on('start', (cmd) => console.log(`[FFmpeg Job ${jobId}] Command: ${cmd}`))
+      .on('codecData', (data) => {
+        if (data.duration) totalDuration = parseDurationToSeconds(data.duration);
+      })
+      .on('progress', async (progress) => {
+        let percent = progress.percent !== undefined
+          ? Math.round(progress.percent)
+          : totalDuration > 0 && progress.timemark
+            ? Math.round((parseDurationToSeconds(progress.timemark) / totalDuration) * 100)
+            : 0;
+        percent = Math.max(1, Math.min(99, percent));
+        await job.updateProgress(percent).catch(() => {});
+        await publishJobProgress(jobId, 'PROCESSING', percent);
+      })
+      .on('end', () => {
+        try {
+          const stats = fs.statSync(outputPath);
+          ffmpeg.ffprobe(outputPath, (err, meta) => {
+            resolve({
+              outputPath,
+              duration: (!err && meta?.format?.duration) ? Math.round(meta.format.duration) : totalDuration,
+              fileSize: stats.size,
+              title,
+            });
+          });
+        } catch (e) {
+          reject(new Error(`Failed to stat output: ${(e as Error).message}`));
+        }
+      })
+      .on('error', (err) => {
+        console.error(`[FFmpeg Job ${jobId}] Error: ${err.message}`);
+        reject(err);
+      })
+      .save(outputPath);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Main transcode function — PIPE METHOD for URLs
+// yt-dlp stdout → FFmpeg stdin (YouTube never sees FFmpeg)
 // ---------------------------------------------------------------------------
 export async function transcodeAudio(job: Job, options: TranscodeOptions): Promise<TranscodeResult> {
   const { jobId, sourceType, sourcePath, sourceUrl, bitrate, sampleRate } = options;
   const outputPath = path.join(CONVERTED_DIR, `${jobId}.mp3`);
 
-  // ---- UPLOAD path (unchanged) ----
+  // ---- UPLOAD path ----
   if (sourceType === 'UPLOAD') {
     if (!fs.existsSync(sourcePath!)) {
       throw new Error(`Upload source file does not exist: ${sourcePath}`);
     }
     console.log(`[Processor] Starting ffmpeg for job: ${jobId} (UPLOAD)`);
-    return transcodeFromFile(job, jobId, sourcePath!, outputPath, bitrate, sampleRate, path.basename(sourcePath!), '', null, false);
+    return transcodeFromFile(job, jobId, sourcePath!, outputPath, bitrate, sampleRate, path.basename(sourcePath!));
   }
 
   // ---- URL path — pipe method ----
   console.log(`[Processor] Starting yt-dlp pipe for job: ${jobId} | URL: ${sourceUrl}`);
 
-  // Fetch metadata in background — non-blocking, don't delay transcode start
+  // Fetch metadata in background — non-blocking
   let metadataTitle = 'Unknown Title';
   let metadataArtist = 'Unknown Artist';
   let thumbnailPath: string | null = null;
@@ -285,19 +347,17 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
     }
   }).catch(() => {});
 
-  // Spawn yt-dlp to pipe audio to stdout
-  const ytDlpArgs = [
+  // Spawn yt-dlp piping audio to stdout
+  const ytDlpProc = spawn(ytDlpPath, [
     '-f', 'bestaudio[ext=m4a]/bestaudio/best',
     '--no-warnings', '--no-progress',
     '--extractor-args', 'youtube:player_client=ios,android',
     '--user-agent', USER_AGENT,
     '--referer', REFERER,
     '--buffer-size', '16K',
-    '-o', '-',   // output to stdout
+    '-o', '-',
     sourceUrl!,
-  ];
-
-  const ytDlpProc = spawn(ytDlpPath, ytDlpArgs);
+  ]);
 
   const errChunks: Buffer[] = [];
   ytDlpProc.stderr.on('data', (chunk: Buffer) => {
@@ -307,11 +367,8 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
 
   console.log(`[Processor] Starting ffmpeg for job: ${jobId} (PIPE)`);
 
-  // Wait for metadata (up to 8s) then transcode — metadata is embedded after
   const transcodeResult = await new Promise<TranscodeResult>((resolve, reject) => {
     let totalDuration = 0;
-    let ytDlpExited = false;
-    let ytDlpExitCode: number | null = null;
 
     ytDlpProc.on('error', (err: any) => {
       reject(err.code === 'ENOENT'
@@ -320,23 +377,20 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
     });
 
     ytDlpProc.on('close', (code) => {
-      ytDlpExited = true;
-      ytDlpExitCode = code;
       if (code !== 0 && code !== null) {
         const errMsg = Buffer.concat(errChunks).toString('utf8');
         console.error(`[yt-dlp ${jobId}] Exited with code ${code}: ${errMsg}`);
       }
     });
 
-    // Feed yt-dlp stdout directly into FFmpeg via pipe:0
-    const command = ffmpeg()
+    ffmpeg()
       .input(ytDlpProc.stdout as any)
-      .inputFormat('mp4')           // m4a/bestaudio container hint
+      .inputFormat('mp4')
       .audioCodec('libmp3lame')
       .audioBitrate(bitrate)
       .audioFrequency(sampleRate)
       .addOptions(['-threads', '0'])
-      .outputOptions(['-vn'])       // strip video/cover — add cover art after
+      .outputOptions(['-vn'])
       .on('start', (cmdline) => {
         console.log(`[FFmpeg Job ${jobId}] Command: ${cmdline}`);
         console.log(`[FFmpeg] Process spawned successfully`);
@@ -376,149 +430,19 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
       })
       .on('error', (err) => {
         console.error(`[FFmpeg Job ${jobId}] Error: ${err.message}`);
-        // Kill yt-dlp if FFmpeg fails
         try { ytDlpProc.kill(); } catch {}
         reject(err);
       })
       .save(outputPath);
   });
 
-  // Wait for metadata to finish loading before returning
+  // Wait for metadata (max 3s) then embed
   await Promise.race([metaPromise, new Promise(r => setTimeout(r, 3000))]);
 
-  // Embed metadata + cover art into the finished MP3
   if (metadataTitle !== 'Unknown Title' || thumbnailPath) {
     await embedMetadata(outputPath, metadataTitle, metadataArtist, thumbnailPath);
   }
   if (thumbnailPath && fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
 
   return { ...transcodeResult, title: metadataTitle };
-}
-
-// ---------------------------------------------------------------------------
-// Embed ID3 metadata + cover art into an existing MP3 (post-transcode)
-// ---------------------------------------------------------------------------
-function embedMetadata(
-  filePath: string,
-  title: string,
-  artist: string,
-  thumbnailPath: string | null
-): Promise<void> {
-  return new Promise((resolve) => {
-    const tmpPath = filePath + '.meta.mp3';
-    let command = ffmpeg(filePath).audioCodec('copy');
-
-    if (thumbnailPath && fs.existsSync(thumbnailPath)) {
-      command = command
-        .input(thumbnailPath)
-        .outputOptions([
-          '-map', '0:a',
-          '-map', '1:v',
-          '-disposition:v:0', 'attached_pic',
-        ]);
-    }
-
-    command
-      .outputOptions([
-        '-metadata', `title=${title}`,
-        '-metadata', `artist=${artist}`,
-        '-id3v2_version', '3',
-      ])
-      .on('end', () => {
-        try {
-          fs.renameSync(tmpPath, filePath);
-        } catch {}
-        resolve();
-      })
-      .on('error', () => {
-        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch {}
-        resolve(); // non-fatal — file already transcoded
-      })
-      .save(tmpPath);
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Transcode from a local file path (UPLOAD flow)
-// ---------------------------------------------------------------------------
-function transcodeFromFile(
-  job: Job,
-  jobId: string,
-  inputPath: string,
-  outputPath: string,
-  bitrate: number,
-  sampleRate: number,
-  title: string,
-  artist: string,
-  thumbnailPath: string | null,
-  hasMetadata: boolean
-): Promise<TranscodeResult> {
-  return new Promise((resolve, reject) => {
-    let totalDuration = 0;
-    let command = ffmpeg(inputPath)
-      .audioCodec('libmp3lame')
-      .audioBitrate(bitrate)
-      .audioFrequency(sampleRate)
-      .addOptions(['-threads', '0']);
-
-    if (thumbnailPath && fs.existsSync(thumbnailPath)) {
-      command = command.input(thumbnailPath)
-        .outputOptions(['-map', '0:a', '-map', '1:v', '-disposition:v:0', 'attached_pic']);
-    }
-    if (hasMetadata) {
-      command = command.outputOptions([
-        '-metadata', `title=${title}`,
-        '-metadata', `artist=${artist}`,
-        '-id3v2_version', '3',
-      ]);
-    }
-
-    command
-      .on('start', (cmd) => console.log(`[FFmpeg Job ${jobId}] Command: ${cmd}`))
-      .on('codecData', (data) => {
-        if (data.duration) totalDuration = parseDurationToSeconds(data.duration);
-      })
-      .on('progress', async (progress) => {
-        let percent = progress.percent !== undefined
-          ? Math.round(progress.percent)
-          : totalDuration > 0 && progress.timemark
-            ? Math.round((parseDurationToSeconds(progress.timemark) / totalDuration) * 100)
-            : 0;
-        percent = Math.max(1, Math.min(99, percent));
-        await job.updateProgress(percent).catch(() => {});
-        await publishJobProgress(jobId, 'PROCESSING', percent);
-      })
-      .on('end', () => {
-        if (thumbnailPath && fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
-        try {
-          const stats = fs.statSync(outputPath);
-          ffmpeg.ffprobe(outputPath, (err, meta) => {
-            resolve({
-              outputPath,
-              duration: (!err && meta?.format?.duration) ? Math.round(meta.format.duration) : totalDuration,
-              fileSize: stats.size,
-              title,
-            });
-          });
-        } catch (e) {
-          reject(new Error(`Failed to stat output: ${(e as Error).message}`));
-        }
-      })
-      .on('error', (err) => {
-        console.error(`[FFmpeg Job ${jobId}] Error: ${err.message}`);
-        if (thumbnailPath && fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
-        reject(err);
-      })
-      .save(outputPath);
-  });
-}
-
-function parseDurationToSeconds(durationStr: string): number {
-  try {
-    const parts = durationStr.split(':');
-    if (parts.length === 3) {
-      return parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
-    }
-    return parseFloat(durationStr) || 0;
-  } catch { return 0; }
 }
