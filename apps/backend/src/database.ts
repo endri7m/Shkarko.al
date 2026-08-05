@@ -12,18 +12,22 @@ console.log('[Database] Loaded DATABASE_URL:', databaseUrl.replace(/:[^:@]+@/, '
 export let useMemoryDb = false;
 const memoryDb = new Map<string, ConversionJob>();
 
-const isProduction = process.env.NODE_ENV === 'production' || 
-  databaseUrl.includes('supabase.co') || 
+// Strip sslmode from URL — we control SSL via the ssl object below to avoid conflicts
+const cleanDatabaseUrl = databaseUrl.replace(/[?&]sslmode=[^&]*/g, '').replace(/\?$/, '');
+
+const isRemoteDb =
   databaseUrl.includes('supabase') ||
-  databaseUrl.includes('.db.') || 
-  databaseUrl.includes('neon.tech') || 
-  databaseUrl.includes('elephantsql') || 
-  process.env.DB_SSL === 'true';
+  databaseUrl.includes('neon.tech') ||
+  databaseUrl.includes('elephantsql') ||
+  databaseUrl.includes('pooler') ||
+  process.env.DB_SSL === 'true' ||
+  process.env.NODE_ENV === 'production';
 
 export const pool = new Pool({
-  connectionString: databaseUrl,
-  connectionTimeoutMillis: 5000, 
-  ssl: isProduction ? { rejectUnauthorized: false } : undefined,
+  connectionString: cleanDatabaseUrl,
+  connectionTimeoutMillis: 8000,
+  // Always use rejectUnauthorized: false for remote hosted DBs (Supabase uses self-signed certs)
+  ssl: isRemoteDb ? { rejectUnauthorized: false } : undefined,
 });
 
 /**
@@ -31,13 +35,13 @@ export const pool = new Pool({
  * Automatically falls back to in-memory store if DB is offline after retries.
  */
 export async function initDatabase(): Promise<void> {
-  let retries = 5;
-  let delay = 2000;
+  let retries = 3;
+  let delay = 1500;
   let clientConnected = false;
 
   while (retries > 0) {
     try {
-      console.log(`[Database] Attempting to connect to PostgreSQL... (Attempts remaining: ${retries})`);
+      console.log(`[Database] Attempting to connect... (Attempts remaining: ${retries})`);
       const testClient = await pool.connect();
       testClient.release();
       clientConnected = true;
@@ -47,7 +51,7 @@ export async function initDatabase(): Promise<void> {
       retries--;
       console.warn(`[Database] Connection failed: ${error.message}`);
       if (retries === 0) {
-        console.warn('[Database] PostgreSQL is unreachable after multiple attempts. Activating IN-MEMORY database fallback.');
+        console.warn('[Database] Unreachable after retries. Activating IN-MEMORY fallback — conversions will still work.');
         useMemoryDb = true;
         return;
       }

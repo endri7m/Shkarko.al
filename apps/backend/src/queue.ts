@@ -58,21 +58,20 @@ export interface ConversionQueueJobData {
  * Local asynchronous task processing loop (in-process runner fallback)
  */
 async function runInProcessTranscode(jobId: string, data: ConversionQueueJobData): Promise<void> {
-  console.log(`[Queue Fallback] Launching transcoding loop for job ${jobId}...`);
+  console.log(`[Queue] Launching in-process transcoding for job ${jobId}...`);
   try {
-    // 1. Mark status as PROCESSING in DB
-    await updateJobProgress(jobId, 0, 'PROCESSING');
+    // Mark PROCESSING — fire and forget DB write, don't block on it
+    updateJobProgress(jobId, 0, 'PROCESSING').catch(() => {});
     localProgressEvents.emit(`job-progress:${jobId}`, { jobId, status: 'PROCESSING', progress: 0 });
 
-    // Mock BullMQ job object for progress updates
     const mockJob = {
       updateProgress: async (progressValue: number) => {
-        await updateJobProgress(jobId, progressValue, 'PROCESSING');
+        // DB write is best-effort — never block the transcode on DB failure
+        updateJobProgress(jobId, progressValue, 'PROCESSING').catch(() => {});
         localProgressEvents.emit(`job-progress:${jobId}`, { jobId, status: 'PROCESSING', progress: progressValue });
       }
     } as any;
 
-    // 2. Transcode
     const result = await transcodeAudio(mockJob, {
       jobId,
       sourceType: data.sourceType,
@@ -82,12 +81,11 @@ async function runInProcessTranscode(jobId: string, data: ConversionQueueJobData
       sampleRate: data.sampleRate,
     });
 
-    // Complete job - serve via backend download endpoint
     const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
     const localDownloadUrl = `${backendUrl}/api/jobs/${jobId}/download`;
 
-    await updateJobProgress(jobId, 100, 'COMPLETED', undefined, undefined, result.fileSize, result.duration);
-    
+    updateJobProgress(jobId, 100, 'COMPLETED', undefined, undefined, result.fileSize, result.duration).catch(() => {});
+
     const completionPayload = {
       jobId,
       status: 'COMPLETED' as const,
@@ -96,43 +94,27 @@ async function runInProcessTranscode(jobId: string, data: ConversionQueueJobData
       duration: result.duration,
       fileSize: result.fileSize,
     };
-    
+
     localProgressEvents.emit(`job-progress:${jobId}`, completionPayload);
-    try {
-      await publishJobProgress(jobId, 'COMPLETED', 100, {
-        s3Url: localDownloadUrl,
-        duration: result.duration,
-        fileSize: result.fileSize,
-      });
-    } catch {}
+    publishJobProgress(jobId, 'COMPLETED', 100, {
+      s3Url: localDownloadUrl,
+      duration: result.duration,
+      fileSize: result.fileSize,
+    }).catch(() => {});
 
-    console.log(`[Queue Fallback] Job ${jobId} completed successfully.`);
+    console.log(`[Queue] Job ${jobId} completed. Download: ${localDownloadUrl}`);
   } catch (error: any) {
-    console.error(`[Queue Fallback] Job ${jobId} failed:`, error);
-    const friendlyErrorMessage = error.message || 'Transcoding engine encountered a local error.';
+    console.error(`[Queue] Job ${jobId} failed:`, error.message);
+    const msg = error.message || 'Transcoding engine encountered an error.';
 
-    await updateJobProgress(jobId, 0, 'FAILED', undefined, friendlyErrorMessage);
-    
-    const failPayload = {
-      jobId,
-      status: 'FAILED' as const,
-      progress: 0,
-      errorMessage: friendlyErrorMessage,
-    };
+    updateJobProgress(jobId, 0, 'FAILED', undefined, msg).catch(() => {});
+
+    const failPayload = { jobId, status: 'FAILED' as const, progress: 0, errorMessage: msg };
     localProgressEvents.emit(`job-progress:${jobId}`, failPayload);
-    try {
-      await publishJobProgress(jobId, 'FAILED', 0, {
-        errorMessage: friendlyErrorMessage,
-      });
-    } catch {}
+    publishJobProgress(jobId, 'FAILED', 0, { errorMessage: msg }).catch(() => {});
   } finally {
-    // Cleanup temporary upload files
     if (data.sourcePath && fs.existsSync(data.sourcePath)) {
-      try {
-        fs.unlinkSync(data.sourcePath);
-      } catch (err) {
-        console.error('[Queue Fallback] Cleanup error:', err);
-      }
+      try { fs.unlinkSync(data.sourcePath); } catch {}
     }
   }
 }
