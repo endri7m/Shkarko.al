@@ -17,13 +17,14 @@ FROM node:20-alpine AS runner
 
 WORKDIR /app
 
-# Install ffmpeg, python3, pip, and yt-dlp
+# Install ffmpeg, python3, pip, and yt-dlp (always latest version)
 RUN apk add --no-cache \
     ffmpeg \
     python3 \
     py3-pip \
     curl \
   && pip3 install --no-cache-dir --break-system-packages yt-dlp \
+  && pip3 install --no-cache-dir --break-system-packages --upgrade yt-dlp \
   && yt-dlp --version
 
 # Copy package configurations

@@ -5,21 +5,29 @@ import dotenv from 'dotenv';
 // Load environment variables before parsing databaseUrl
 dotenv.config();
 
-const databaseUrl = process.env.DATABASE_URL || 'postgresql://sonicflow_user:sonicflow_password@localhost:5432/sonicflow?sslmode=disable';
+const databaseUrl = (process.env.DATABASE_URL || 'postgresql://sonicflow_user:sonicflow_password@localhost:5432/sonicflow?sslmode=disable').trim();
 
 console.log('[Database] Loaded DATABASE_URL:', databaseUrl.replace(/:[^:@]+@/, ':****@'));
 
 export let useMemoryDb = false;
 const memoryDb = new Map<string, ConversionJob>();
 
-// Strip sslmode from URL — we control SSL via the ssl object below to avoid conflicts
-const cleanDatabaseUrl = databaseUrl.replace(/[?&]sslmode=[^&]*/g, '').replace(/\?$/, '');
+// Strip sslmode AND any stray params that conflict with the ssl object
+const cleanDatabaseUrl = databaseUrl
+  .replace(/[?&]sslmode=[^&]*/g, '')
+  .replace(/[?&]sslallowany=[^&]*/g, '')
+  .replace(/[?&]uselibpqcompat=[^&]*/g, '')
+  .replace(/\?&/, '?')
+  .replace(/[?&]$/, '');
+
+console.log('[Database] Clean URL (no ssl params):', cleanDatabaseUrl.replace(/:[^:@]+@/, ':****@'));
 
 const isRemoteDb =
   databaseUrl.includes('supabase') ||
   databaseUrl.includes('neon.tech') ||
   databaseUrl.includes('elephantsql') ||
   databaseUrl.includes('pooler') ||
+  databaseUrl.includes('.db.') ||
   process.env.DB_SSL === 'true' ||
   process.env.NODE_ENV === 'production';
 

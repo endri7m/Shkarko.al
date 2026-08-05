@@ -201,14 +201,24 @@ router.post('/url', uploadRateLimiter, ssrfProtection, async (req: Request, res:
 });
 
 /**
- * Poll Job Status
+ * Poll Job Status — used by frontend polling every 2s
  */
 router.get('/:id', async (req: Request, res: Response) => {
-  const job = await getJob(req.params.id);
-  if (!job) {
-    return res.status(404).json({ error: 'Job not found.' });
+  try {
+    const job = await getJob(req.params.id);
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found.' });
+    }
+    // Attach download URL if completed
+    const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
+    const response: any = { ...job };
+    if (job.status === 'COMPLETED') {
+      response.s3Url = `${backendUrl}/api/jobs/${job.id}/download`;
+    }
+    return res.json(response);
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch job status.' });
   }
-  return res.json(job);
 });
 
 /**

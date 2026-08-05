@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { JobStatus } from '@sonicflow/shared';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
+const POLL_INTERVAL_MS = 2000;
 
 export type ClientConversionStatus = 'idle' | 'submitting' | 'queued' | 'processing' | 'completed' | 'failed';
 
@@ -17,91 +18,88 @@ export function useConversion() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [s3Url, setS3Url] = useState<string | null>(null);
   const [metadata, setMetadata] = useState<JobMetadata>({});
-  
-  const eventSourceRef = useRef<EventSource | null>(null);
 
-  // Close EventSource connection
-  const closeConnection = useCallback(() => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const filenameRef = useRef<string>('converted.mp3');
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
     }
   }, []);
 
-  // Reset converter state
   const reset = useCallback(() => {
-    closeConnection();
+    stopPolling();
     setStatus('idle');
     setProgress(0);
     setErrorMessage(null);
     setS3Url(null);
     setMetadata({});
-  }, [closeConnection]);
+  }, [stopPolling]);
 
-  // Cleanup on unmount
   useEffect(() => {
-    return () => closeConnection();
-  }, [closeConnection]);
+    return () => stopPolling();
+  }, [stopPolling]);
 
-  // Connect to SSE stream
-  const connectSSE = useCallback((jobId: string, filename: string) => {
-    closeConnection();
-    
-    const sseUrl = `${API_URL}/api/jobs/${jobId}/progress`;
-    const eventSource = new EventSource(sseUrl);
-    eventSourceRef.current = eventSource;
+  const handleJobUpdate = useCallback((data: any, filename: string) => {
+    if (!data) return;
 
+    const jobStatus = (data.status || '').toUpperCase() as JobStatus;
+    const jobProgress = typeof data.progress === 'number' ? data.progress : 0;
+
+    setProgress(jobProgress);
+
+    if (jobStatus === 'PROCESSING' || jobStatus === 'PENDING') {
+      setStatus(jobStatus === 'PROCESSING' ? 'processing' : 'queued');
+    } else if (jobStatus === 'COMPLETED') {
+      const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
+      const downloadUrl = data.s3Key
+        ? `${backendUrl}/api/jobs/${data.id}/download`
+        : data.s3Url || null;
+
+      setS3Url(downloadUrl);
+      setMetadata({
+        duration: data.duration,
+        fileSize: data.fileSize,
+        filename,
+      });
+      setStatus('completed');
+      setProgress(100);
+      stopPolling();
+    } else if (jobStatus === 'FAILED') {
+      setErrorMessage(data.errorMessage || data.error_message || 'Conversion failed on the processing node.');
+      setStatus('failed');
+      stopPolling();
+    }
+  }, [stopPolling]);
+
+  // Polling — calls GET /api/jobs/:id every 2 seconds
+  const startPolling = useCallback((jobId: string, filename: string) => {
+    stopPolling();
+    filenameRef.current = filename;
     setStatus('queued');
 
-    eventSource.onmessage = (event) => {
+    const poll = async () => {
       try {
-        const data = JSON.parse(event.data);
-        
-        if (data.error) {
-          setErrorMessage(data.error);
-          setStatus('failed');
-          closeConnection();
+        const res = await fetch(`${API_URL}/api/jobs/${jobId}`);
+        if (!res.ok) {
+          // Job not found yet — keep polling
           return;
         }
-
-        const jobStatus = (data.status || '').toUpperCase() as JobStatus;
-        const jobProgress = data.progress ?? 0;
-
-        setProgress(jobProgress);
-
-        if (jobStatus === 'PROCESSING') {
-          setStatus('processing');
-        } else if (jobStatus === 'COMPLETED') {
-          setS3Url(data.s3Url || null);
-          setMetadata((prev) => ({
-            ...prev,
-            duration: data.duration,
-            fileSize: data.fileSize,
-            filename,
-          }));
-          setStatus('completed');
-          closeConnection();
-        } else if (jobStatus === 'FAILED') {
-          setErrorMessage(data.errorMessage || 'Conversion failed on the processing node.');
-          setStatus('failed');
-          closeConnection();
-        }
+        const data = await res.json();
+        handleJobUpdate(data, filename);
       } catch (err) {
-        console.error('Error parsing progress stream message:', err);
-        setErrorMessage('Failed to read status updates from transcode server.');
-        setStatus('failed');
-        closeConnection();
+        console.error('[Polling] Fetch error:', err);
+        // Network hiccup — keep polling, don't fail the job
       }
     };
 
-    eventSource.onerror = (err) => {
-      console.error('EventSource connection error:', err);
-      setErrorMessage('Lost connection to audio processing console. Retrying...');
-      // Allow connection to retry automatically, or fail if we've been trying too long
-    };
-  }, [closeConnection]);
+    // Poll immediately, then every 2 seconds
+    poll();
+    pollRef.current = setInterval(poll, POLL_INTERVAL_MS);
+  }, [stopPolling, handleJobUpdate]);
 
-  // Submit audio file for conversion
   const convertFile = useCallback(async (file: File, bitrate: number, sampleRate: number) => {
     reset();
     setStatus('submitting');
@@ -119,53 +117,42 @@ export function useConversion() {
       });
 
       const data = await response.json();
-      
-      if (!response.ok) {
-        throw new Error(data.error || 'Server rejected the file upload.');
-      }
+      if (!response.ok) throw new Error(data.error || 'Server rejected the file upload.');
 
-      connectSSE(data.jobId, file.name);
+      startPolling(data.jobId, file.name);
     } catch (err: any) {
       setErrorMessage(err.message || 'Failed to upload audio file.');
       setStatus('failed');
     }
-  }, [connectSSE, reset]);
+  }, [reset, startPolling]);
 
-  // Submit audio URL for conversion
   const convertUrl = useCallback(async (url: string, bitrate: number, sampleRate: number) => {
     reset();
-    setStatus('queued'); // Set to queued state immediately
-    
-    // Extract hypothetical filename
+    setStatus('queued');
+
     let filename = 'remote-audio';
     try {
       const u = new URL(url);
       filename = u.pathname.split('/').pop() || 'remote-audio';
     } catch {}
-    
     setMetadata({ filename });
 
     try {
       const response = await fetch(`${API_URL}/api/v1/convert/url`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, bitrate, sampleRate }),
       });
 
       const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Server rejected the URL request.');
 
-      if (!response.ok) {
-        throw new Error(data.error || 'Server rejected the URL request.');
-      }
-
-      connectSSE(data.jobId, filename);
+      startPolling(data.jobId, filename);
     } catch (err: any) {
       setErrorMessage(err.message || 'Failed to submit remote audio URL.');
       setStatus('failed');
     }
-  }, [connectSSE, reset]);
+  }, [reset, startPolling]);
 
   return {
     status,
