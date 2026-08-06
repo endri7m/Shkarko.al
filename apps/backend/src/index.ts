@@ -1,5 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
+import fs from 'fs';
 import dotenv from 'dotenv';
 import { initDatabase } from './database';
 import jobsRouter from './routes/jobs';
@@ -8,6 +9,10 @@ import { initQueue } from './queue';
 
 dotenv.config();
 
+// Ensure converted dir exists before anything else
+const CONVERTED_DIR = '/tmp/shkarko-al/converted';
+try { fs.mkdirSync(CONVERTED_DIR, { recursive: true }); } catch {}
+
 const app = express();
 const port = Number(process.env.PORT) || 5000;
 
@@ -15,6 +20,17 @@ app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Serve converted MP3 files directly as static assets
+app.use('/api/v1/downloads', express.static(CONVERTED_DIR, {
+  setHeaders: (res) => {
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-cache');
+  },
 }));
 
 app.use(express.json());

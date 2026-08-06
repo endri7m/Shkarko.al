@@ -207,7 +207,8 @@ router.get('/:id', async (req: Request, res: Response) => {
   try {
     const jobId = req.params.id;
     const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
-    const downloadUrl = `${backendUrl}/api/jobs/${jobId}/download`;
+    // Use static file route — faster and doesn't go through Express download handler
+    const downloadUrl = `${backendUrl}/api/v1/downloads/${jobId}.mp3`;
 
     // Check if the converted file already exists on disk — source of truth
     const convertedPath = path.join('/tmp/shkarko-al/converted', `${jobId}.mp3`);

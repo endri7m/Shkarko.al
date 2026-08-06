@@ -230,7 +230,7 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
       if (!settled) {
         settled = true;
         clearTimeout(killTimer);
-        try { ytDlpProc.kill('SIGKILL'); } catch {}
+        // Don't SIGKILL yt-dlp here — let it exit naturally so the pipe flushes fully
         resolve(r);
       }
     };
@@ -285,11 +285,20 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
         await publishJobProgress(jobId, 'PROCESSING', pct);
       })
       .on('end', () => {
-        // *** NUCLEAR OPTION: resolve immediately, nothing else ***
-        let fileSize = 0;
-        try { if (fs.existsSync(outputPath)) fileSize = fs.statSync(outputPath).size; } catch {}
-        console.log(`[FFmpeg ${jobId}] END — size: ${fileSize} bytes — resolving NOW`);
-        done({ outputPath, duration: totalDuration, fileSize, title: jobId });
+        // FFmpeg has finished writing — read file size after a short flush delay
+        console.log(`[FFmpeg ${jobId}] END event fired. Waiting for file flush...`);
+        setTimeout(() => {
+          let fileSize = 0;
+          try {
+            if (fs.existsSync(outputPath)) {
+              fileSize = fs.statSync(outputPath).size;
+            } else {
+              console.error(`[FFmpeg ${jobId}] Output file missing: ${outputPath}`);
+            }
+          } catch {}
+          console.log(`[FFmpeg ${jobId}] Final size: ${fileSize} bytes — resolving.`);
+          done({ outputPath, duration: totalDuration, fileSize, title: jobId });
+        }, 500); // 500ms flush grace period
       })
       .on('error', err => {
         console.error(`[FFmpeg ${jobId}] Error: ${err.message}`);

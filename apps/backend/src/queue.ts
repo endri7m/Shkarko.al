@@ -82,7 +82,7 @@ async function runInProcessTranscode(jobId: string, data: ConversionQueueJobData
     });
 
     const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
-    const localDownloadUrl = `${backendUrl}/api/jobs/${jobId}/download`;
+    const localDownloadUrl = `${backendUrl}/api/v1/downloads/${jobId}.mp3`;
 
     updateJobProgress(jobId, 100, 'COMPLETED', undefined, undefined, result.fileSize, result.duration).catch(() => {});
 
