@@ -9,7 +9,7 @@ import { initQueue } from './queue';
 dotenv.config();
 
 const app = express();
-const port = process.env.PORT || 5000;
+const port = Number(process.env.PORT) || 5000;
 
 app.use(cors({
   origin: '*',
@@ -19,21 +19,19 @@ app.use(cors({
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
 app.use('/api', apiRateLimiter);
-
 app.use('/api/jobs', jobsRouter);
 app.use('/api/v1/convert', jobsRouter);
 
-app.get('/health', (req: Request, res: Response) => {
+app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'healthy', timestamp: new Date() });
 });
 
-app.get('/', (req: Request, res: Response) => {
+app.get('/', (_req: Request, res: Response) => {
   res.json({ status: 'Server is running', version: '1.0.0' });
 });
 
-app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   console.error('Unhandled Server Error:', err);
   res.status(err.status || 500).json({
     error: err.message || 'An unexpected server error occurred.',
@@ -41,20 +39,37 @@ app.use((err: any, req: Request, res: Response, next: NextFunction) => {
   });
 });
 
-async function startServer() {
-  try {
-    await initDatabase();
+// ---------------------------------------------------------------------------
+// Start listening FIRST so Railway health checks pass immediately,
+// then init DB and queue in the background.
+// ---------------------------------------------------------------------------
+const server = app.listen(port, '0.0.0.0', () => {
+  console.log(`[SonicFlow Backend] Listening on 0.0.0.0:${port}`);
 
-    // Explicitly start the in-process job queue/worker
-    initQueue();
-
-    app.listen(Number(port), '0.0.0.0', () => {
-      console.log(`[SonicFlow Backend] API Server listening on 0.0.0.0:${port}`);
+  // Non-blocking background init — server is already accepting requests
+  Promise.resolve()
+    .then(() => initDatabase())
+    .then(() => {
+      initQueue();
+      console.log('[SonicFlow Backend] Database and queue ready.');
+    })
+    .catch((err) => {
+      console.error('[SonicFlow Backend] Background init error (non-fatal):', err.message);
+      // Don't crash — DB fallback is already handled inside initDatabase()
     });
-  } catch (error) {
-    console.error('Fatal: Server startup failed:', error);
-    process.exit(1);
-  }
-}
+});
 
-startServer();
+// Graceful shutdown on SIGTERM (Railway sends this before killing the container)
+process.on('SIGTERM', () => {
+  console.log('[SonicFlow Backend] SIGTERM received — shutting down gracefully...');
+  server.close(() => {
+    console.log('[SonicFlow Backend] HTTP server closed.');
+    process.exit(0);
+  });
+  // Force exit after 10s if connections don't drain
+  setTimeout(() => process.exit(0), 10_000).unref();
+});
+
+process.on('SIGINT', () => {
+  server.close(() => process.exit(0));
+});

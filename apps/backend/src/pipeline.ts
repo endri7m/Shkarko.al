@@ -119,21 +119,34 @@ interface YtDlpMetadata {
 }
 
 // ---------------------------------------------------------------------------
-// yt-dlp metadata fetch (text output only, no streaming)
+// Track active child processes for cleanup on shutdown
 // ---------------------------------------------------------------------------
+const activeProcesses = new Set<ReturnType<typeof spawn>>();
+
+process.on('SIGTERM', () => {
+  console.log(`[Pipeline] SIGTERM — killing ${activeProcesses.size} active child processes`);
+  for (const proc of activeProcesses) {
+    try { proc.kill('SIGKILL'); } catch {}
+  }
+});
+
+function trackProcess(proc: ReturnType<typeof spawn>): ReturnType<typeof spawn> {
+  activeProcesses.add(proc);
+  proc.on('close', () => activeProcesses.delete(proc));
+  return proc;
+}
+
 function runYtDlpText(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
-    const proc = spawn(ytDlpPath, args);
+    const proc = trackProcess(spawn(ytDlpPath, args));
 
     proc.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
     proc.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
 
     proc.on('error', (err: any) => {
-      reject(err.code === 'ENOENT'
-        ? new Error('yt-dlp is not installed.')
-        : err);
+      reject(err.code === 'ENOENT' ? new Error('yt-dlp is not installed.') : err);
     });
 
     proc.on('close', (code) => {
@@ -143,6 +156,9 @@ function runYtDlpText(args: string[]): Promise<string> {
         resolve(Buffer.concat(chunks).toString('utf8'));
       }
     });
+
+    // Auto-kill after 30s to prevent zombies
+    setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 30_000).unref();
   });
 }
 
@@ -362,8 +378,8 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
     }
   }).catch(() => {});
 
-  // Spawn yt-dlp piping audio to stdout
-  const ytDlpProc = spawn(ytDlpPath, [
+  // Spawn yt-dlp piping audio to stdout — stream directly, never buffer in memory
+  const ytDlpProc = trackProcess(spawn(ytDlpPath, [
     '-f', 'bestaudio[ext=m4a]/bestaudio/best',
     '--no-warnings', '--no-progress',
     '--extractor-args', 'youtube:player_client=ios,android',
@@ -372,7 +388,12 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
     '--buffer-size', '16K',
     '-o', '-',
     sourceUrl!,
-  ]);
+  ]));
+
+  // Auto-kill yt-dlp after 5 minutes to prevent zombies on hung streams
+  const ytDlpKillTimer = setTimeout(() => {
+    try { ytDlpProc.kill('SIGKILL'); } catch {}
+  }, 5 * 60_000).unref();
 
   const errChunks: Buffer[] = [];
   ytDlpProc.stderr.on('data', (chunk: Buffer) => {
@@ -471,11 +492,14 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
       })
       .on('error', (err) => {
         console.error(`[FFmpeg Job ${jobId}] Error: ${err.message}`);
-        try { ytDlpProc.kill(); } catch {}
+        clearTimeout(ytDlpKillTimer);
+        try { ytDlpProc.kill('SIGKILL'); } catch {}
         safeReject(err);
       })
       .save(outputPath);
   });
+
+  clearTimeout(ytDlpKillTimer);
 
   // Wait for metadata (max 5s) then embed — skip entirely if it takes too long
   try {
