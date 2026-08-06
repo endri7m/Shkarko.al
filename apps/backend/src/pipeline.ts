@@ -142,8 +142,8 @@ function runYtDlpText(args: string[]): Promise<string> {
     const errChunks: Buffer[] = [];
     const proc = trackProcess(spawn(ytDlpPath, args));
 
-    proc.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
-    proc.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
+    proc.stdout!.on('data', (chunk: Buffer) => chunks.push(chunk));
+    proc.stderr!.on('data', (chunk: Buffer) => errChunks.push(chunk));
 
     proc.on('error', (err: any) => {
       reject(err.code === 'ENOENT' ? new Error('yt-dlp is not installed.') : err);
@@ -396,7 +396,7 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
   }, 5 * 60_000).unref();
 
   const errChunks: Buffer[] = [];
-  ytDlpProc.stderr.on('data', (chunk: Buffer) => {
+  ytDlpProc.stderr!.on('data', (chunk: Buffer) => {
     errChunks.push(chunk);
     process.stdout.write(`[yt-dlp ${jobId}] ${chunk.toString()}`);
   });
@@ -428,7 +428,7 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
     });
 
     ffmpeg()
-      .input(ytDlpProc.stdout as any)
+      .input(ytDlpProc.stdout! as any)
       .inputFormat('mp4')
       .audioCodec('libmp3lame')
       .audioBitrate(bitrate)
