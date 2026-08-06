@@ -1,353 +1,138 @@
 import { Router, Request, Response } from 'express';
-import multer from 'multer';
 import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs';
 import path from 'path';
-import IORedis from 'ioredis';
-import { createJob, getJob, updateJobProgress } from '../database';
-import { addConversionJob, useMemoryQueue, localProgressEvents } from '../queue';
-import { ssrfProtection } from '../middleware/ssrf';
-import { uploadRateLimiter } from '../middleware/rateLimit';
+import { processJob } from '../pipeline';
 
 const router = Router();
 
-// Ensure local directories exist
-const SCRATCH_DIR = '/tmp/sonicflow-scratch';
-const UPLOAD_DIR = path.join(SCRATCH_DIR, 'uploads');
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const BACKEND_URL    = () => process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
+const CONVERTED_DIR  = '/tmp/converted';
+const UPLOAD_DIR     = '/tmp/uploads';
+
+[CONVERTED_DIR, UPLOAD_DIR].forEach(d => { try { fs.mkdirSync(d, { recursive: true }); } catch {} });
+
+// ---------------------------------------------------------------------------
+// In-memory job store — no DB, no Redis, no BullMQ
+// ---------------------------------------------------------------------------
+interface JobState {
+  id: string;
+  status: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
+  progress: number;
+  title: string;
+  fileSize: number;
+  errorMessage?: string;
+  createdAt: string;
 }
 
-// Multer storage config
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, UPLOAD_DIR);
-  },
-  filename: (req, file, cb) => {
-    // Temp filename before validation
-    cb(null, `${uuidv4()}-${file.originalname}`);
-  },
-});
+const jobs = new Map<string, JobState>();
 
-const upload = multer({
-  storage: storage,
-  limits: {
-    fileSize: 50 * 1024 * 1024, // 50MB Max
-  },
-});
-
-/**
- * Validate audio files based on magic bytes signatures.
- */
-async function validateAudioMagicBytes(filePath: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const fd = fs.openSync(filePath, 'r');
-    const buffer = Buffer.alloc(12);
-    try {
-      fs.readSync(fd, buffer, 0, 12, 0);
-      
-      const hex = buffer.toString('hex').toLowerCase();
-      
-      // MP3: Starts with ID3 (494433) or Sync Word (fff..., ffe...)
-      if (hex.startsWith('494433') || hex.startsWith('fff') || hex.startsWith('ffe')) {
-        return resolve(true);
-      }
-      
-      // WAV: Starts with RIFF (52494646) and Wave (57415645) at index 8
-      if (hex.startsWith('52494646') && hex.substring(16, 24) === '57415645') {
-        return resolve(true);
-      }
-
-      // FLAC: Starts with fLaC (664c6143)
-      if (hex.startsWith('664c6143')) {
-        return resolve(true);
-      }
-
-      // OGG: Starts with OggS (4f676753)
-      if (hex.startsWith('4f676753')) {
-        return resolve(true);
-      }
-
-      // M4A: Starts with ftypM4A (667479704d3441) at offset 4
-      if (hex.substring(8, 22) === '667479704d3441' || hex.substring(8, 20) === '667479706d7034') {
-        return resolve(true);
-      }
-
-      resolve(false);
-    } catch (e) {
-      console.error('Error reading magic bytes:', e);
-      resolve(false);
-    } finally {
-      fs.closeSync(fd);
-    }
-  });
+function getOrFail(id: string, res: Response): JobState | null {
+  const j = jobs.get(id);
+  if (!j) { res.status(404).json({ error: 'Job not found' }); return null; }
+  return j;
 }
 
-/**
- * Endpoint for Direct Audio File Upload
- */
-router.post('/upload', uploadRateLimiter, upload.single('file'), async (req: Request, res: Response) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No audio file uploaded.' });
-  }
-
-  const tempFilePath = req.file.path;
-  const originalName = req.file.originalname;
-
-  try {
-    // 1. Validate magic numbers to ensure it's a real audio file
-    const isValidAudio = await validateAudioMagicBytes(tempFilePath);
-    if (!isValidAudio) {
-      // Clean up invalid upload
-      fs.unlinkSync(tempFilePath);
-      return res.status(400).json({ error: 'Uploaded file is not a valid audio file (failed magic number check).' });
-    }
-
-    // 2. Rename file to match final jobId
-    const jobId = uuidv4();
-    const finalPath = path.join(UPLOAD_DIR, `${jobId}${path.extname(originalName)}`);
-    fs.renameSync(tempFilePath, finalPath);
-
-    // Parse options
-    const bitrate = parseInt(req.body.bitrate, 10) || 320;
-    const sampleRate = parseInt(req.body.sampleRate, 10) || 44100;
-
-    if (![128, 192, 320].includes(bitrate)) {
-      return res.status(400).json({ error: 'Invalid bitrate. Allowed values: 128, 192, 320.' });
-    }
-    if (![44100, 48000].includes(sampleRate)) {
-      return res.status(400).json({ error: 'Invalid sample rate. Allowed values: 44100, 48000.' });
-    }
-
-    // 3. Register job in database
-    const job = await createJob(
-      jobId,
-      'UPLOAD',
-      originalName,
-      undefined,
-      bitrate,
-      sampleRate
-    );
-
-    // 4. Push task to queue
-    await addConversionJob(jobId, {
-      jobId,
-      sourceType: 'UPLOAD',
-      sourcePath: finalPath,
-      sourceName: originalName,
-      bitrate: bitrate as any,
-      sampleRate: sampleRate as any,
-    });
-
-    return res.json({ jobId, status: job.status });
-  } catch (error) {
-    console.error('Upload endpoint error:', error);
-    if (fs.existsSync(tempFilePath)) {
-      fs.unlinkSync(tempFilePath);
-    }
-    return res.status(500).json({ error: 'Internal server error while queueing upload conversion.' });
-  }
-});
-
-/**
- * Endpoint for Remote Audio URL Conversion (SSRF protected)
- */
-router.post('/url', uploadRateLimiter, ssrfProtection, async (req: Request, res: Response) => {
+// ---------------------------------------------------------------------------
+// POST /url  — submit YouTube/audio URL
+// ---------------------------------------------------------------------------
+router.post('/url', async (req: Request, res: Response) => {
   const { url } = req.body;
-  const bitrate = parseInt(req.body.bitrate, 10) || 320;
+  const bitrate    = parseInt(req.body.bitrate,    10) || 320;
   const sampleRate = parseInt(req.body.sampleRate, 10) || 44100;
 
-  if (!url) {
-    return res.status(400).json({ error: 'URL is required.' });
-  }
+  if (!url) return res.status(400).json({ error: 'URL is required' });
+  if (![128, 192, 320].includes(bitrate))         return res.status(400).json({ error: 'Invalid bitrate' });
+  if (![44100, 48000].includes(sampleRate))        return res.status(400).json({ error: 'Invalid sampleRate' });
 
-  if (![128, 192, 320].includes(bitrate)) {
-    return res.status(400).json({ error: 'Invalid bitrate. Allowed values: 128, 192, 320.' });
-  }
-  if (![44100, 48000].includes(sampleRate)) {
-    return res.status(400).json({ error: 'Invalid sample rate. Allowed values: 44100, 48000.' });
-  }
+  const jobId = uuidv4();
+  const job: JobState = {
+    id: jobId,
+    status: 'PENDING',
+    progress: 0,
+    title: '',
+    fileSize: 0,
+    createdAt: new Date().toISOString(),
+  };
+  jobs.set(jobId, job);
 
-  try {
-    const jobId = uuidv4();
-    const parsedUrl = new URL(url);
-    const filename = path.basename(parsedUrl.pathname) || 'remote-audio';
+  // Respond immediately with jobId — processing runs in background
+  res.json({ jobId, status: 'PENDING' });
 
-    // Register job in DB
-    const job = await createJob(
-      jobId,
-      'URL',
-      filename,
-      url,
-      bitrate,
-      sampleRate
-    );
+  // Fire-and-forget async processing
+  setImmediate(async () => {
+    job.status   = 'PROCESSING';
+    job.progress = 1;
 
-    // Push task to queue
-    await addConversionJob(jobId, {
-      jobId,
-      sourceType: 'URL',
-      sourceUrl: url,
-      sourceName: filename,
-      bitrate: bitrate as any,
-      sampleRate: sampleRate as any,
-    });
+    try {
+      const result = await processJob(
+        jobId,
+        url,
+        bitrate as 128 | 192 | 320,
+        sampleRate as 44100 | 48000,
+        (pct: number) => {
+          job.progress = pct;
+        }
+      );
 
-    return res.json({ jobId, status: job.status });
-  } catch (error) {
-    console.error('URL endpoint error:', error);
-    return res.status(500).json({ error: 'Internal server error while queueing URL conversion.' });
-  }
-});
-
-/**
- * Poll Job Status — used by frontend polling every 2s
- */
-router.get('/:id', async (req: Request, res: Response) => {
-  try {
-    const jobId = req.params.id;
-    const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
-    // Use static file route — faster and doesn't go through Express download handler
-    const downloadUrl = `${backendUrl}/api/v1/downloads/${jobId}.mp3`;
-
-    // Check if the converted file already exists on disk — source of truth
-    const convertedPath = path.join('/tmp/shkarko-al/converted', `${jobId}.mp3`);
-    const fileExists = fs.existsSync(convertedPath);
-
-    const job = await getJob(jobId);
-
-    if (!job) {
-      // If DB missed it but file exists, synthesize a COMPLETED response
-      if (fileExists) {
-        return res.json({ id: jobId, status: 'COMPLETED', progress: 100, s3Url: downloadUrl });
-      }
-      return res.status(404).json({ error: 'Job not found.' });
+      job.status   = 'COMPLETED';
+      job.progress = 100;
+      job.title    = result.title;
+      job.fileSize = result.fileSize;
+      console.log(`[Jobs] ${jobId} COMPLETED — "${result.title}" ${result.fileSize} bytes`);
+    } catch (err: any) {
+      job.status       = 'FAILED';
+      job.progress     = 0;
+      job.errorMessage = err.message || 'Conversion failed';
+      console.error(`[Jobs] ${jobId} FAILED:`, err.message);
     }
-
-    const response: any = { ...job };
-
-    // Force COMPLETED if file is on disk — overrides any DB lag
-    if (fileExists && (job.status === 'COMPLETED' || job.progress >= 99)) {
-      response.status = 'COMPLETED';
-      response.progress = 100;
-      response.s3Url = downloadUrl;
-      // Update DB silently so future polls are consistent
-      if (job.status !== 'COMPLETED') {
-        updateJobProgress(job.id, 100, 'COMPLETED').catch(() => {});
-      }
-    } else if (job.status === 'COMPLETED') {
-      response.s3Url = downloadUrl;
-    }
-
-    return res.json(response);
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to fetch job status.' });
-  }
-});
-
-/**
- * SSE Progress Stream
- */
-router.get('/:id/progress', async (req: Request, res: Response) => {
-  const jobId = req.params.id;
-  const job = await getJob(jobId);
-
-  if (!job) {
-    return res.status(404).json({ error: 'Job not found.' });
-  }
-
-  // Setup SSE Headers
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no', // Disable proxy buffering (Nginx)
-  });
-
-  // Write initial state
-  const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
-  const downloadUrl = job.s3Key ? `${backendUrl}/api/jobs/${jobId}/download` : undefined;
-  res.write(`data: ${JSON.stringify({ jobId, status: job.status, progress: job.progress, s3Url: downloadUrl, errorMessage: job.errorMessage })}\n\n`);
-
-  if (job.status === 'COMPLETED' || job.status === 'FAILED') {
-    return res.end();
-  }
-
-  // Connect to Redis for updates, or use Local In-Memory Event Listener if offline
-  if (useMemoryQueue) {
-    const onProgressUpdate = (payload: any) => {
-      res.write(`data: ${JSON.stringify(payload)}\n\n`);
-      if (payload.status === 'COMPLETED' || payload.status === 'FAILED') {
-        localProgressEvents.off(`job-progress:${jobId}`, onProgressUpdate);
-        res.end();
-      }
-    };
-
-    localProgressEvents.on(`job-progress:${jobId}`, onProgressUpdate);
-
-    req.on('close', () => {
-      localProgressEvents.off(`job-progress:${jobId}`, onProgressUpdate);
-    });
-    return;
-  }
-
-  const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-  const redisSubscriber = new IORedis(redisUrl);
-  const channel = `job-progress:${jobId}`;
-
-  redisSubscriber.subscribe(channel, (err) => {
-    if (err) {
-      console.error(`SSE redis subscription error:`, err);
-      res.write(`data: ${JSON.stringify({ error: 'Progress updates stream interrupted.' })}\n\n`);
-      res.end();
-    }
-  });
-
-  redisSubscriber.on('message', (chan, message) => {
-    if (chan === channel) {
-      res.write(`data: ${message}\n\n`);
-      
-      const payload = JSON.parse(message);
-      if (payload.status === 'COMPLETED' || payload.status === 'FAILED') {
-        redisSubscriber.unsubscribe(channel);
-        redisSubscriber.quit();
-        res.end();
-      }
-    }
-  });
-
-  // Clean up subscription on client disconnect
-  req.on('close', () => {
-    redisSubscriber.unsubscribe(channel);
-    redisSubscriber.quit();
   });
 });
 
-/**
- * Local download fallback route serving from scratch space.
- */
-router.get('/:id/download', async (req: Request, res: Response) => {
-  const jobId = req.params.id;
-  const filePath = path.join('/tmp/shkarko-al/converted', `${jobId}.mp3`);
+// ---------------------------------------------------------------------------
+// GET /:id  — poll status (called every 2s by frontend)
+// ---------------------------------------------------------------------------
+router.get('/:id', (req: Request, res: Response) => {
+  const job = getOrFail(req.params.id, res);
+  if (!job) return;
 
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: 'Transcoded file not found or expired.' });
+  const base = BACKEND_URL();
+  const filePath = path.join(CONVERTED_DIR, `${job.id}.mp3`);
+
+  // Double-check: if file exists but status not updated yet, force COMPLETED
+  if (job.status !== 'COMPLETED' && job.status !== 'FAILED' && fs.existsSync(filePath)) {
+    const size = fs.statSync(filePath).size;
+    if (size > 0) {
+      job.status   = 'COMPLETED';
+      job.progress = 100;
+      job.fileSize = size;
+    }
   }
 
-  const job = await getJob(jobId);
-  
-  // Clean, web-safe filename format: Title-of-Video.mp3
-  let filename = 'converted-audio.mp3';
-  if (job && job.sourceName) {
-    const cleanTitle = job.sourceName
-      .replace(/[^a-zA-Z0-9\s-_]/g, '') // strip special characters
-      .trim()
-      .replace(/\s+/g, '-'); // replace whitespace with dashes
-    filename = `${cleanTitle}.mp3`;
+  const response: any = {
+    id:           job.id,
+    status:       job.status,
+    progress:     job.progress,
+    title:        job.title || job.id,
+    fileSize:     job.fileSize,
+    errorMessage: job.errorMessage,
+    createdAt:    job.createdAt,
+  };
+
+  if (job.status === 'COMPLETED') {
+    response.s3Url      = `${base}/downloads/${job.id}.mp3`;
+    response.downloadUrl = response.s3Url;
   }
 
-  res.setHeader('Content-Type', 'audio/mpeg');
-  res.download(filePath, filename);
+  return res.json(response);
+});
+
+// ---------------------------------------------------------------------------
+// GET /  — list recent jobs (debug)
+// ---------------------------------------------------------------------------
+router.get('/', (_req: Request, res: Response) => {
+  const list = Array.from(jobs.values()).slice(-20);
+  return res.json(list);
 });
 
 export default router;

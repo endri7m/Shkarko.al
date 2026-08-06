@@ -2,90 +2,37 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import dotenv from 'dotenv';
-import { initDatabase } from './database';
 import jobsRouter from './routes/jobs';
-import { apiRateLimiter } from './middleware/rateLimit';
-import { initQueue } from './queue';
 
 dotenv.config();
 
-// Ensure converted dir exists before anything else
-const CONVERTED_DIR = '/tmp/shkarko-al/converted';
-try { fs.mkdirSync(CONVERTED_DIR, { recursive: true }); } catch {}
+// Ensure download dir exists
+const DOWNLOAD_DIR = '/tmp/converted';
+try { fs.mkdirSync(DOWNLOAD_DIR, { recursive: true }); } catch {}
+try { fs.mkdirSync('/tmp/raw', { recursive: true }); } catch {}
 
 const app = express();
 const port = Number(process.env.PORT) || 5000;
 
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-}));
-
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Serve converted MP3 files directly as static assets
-app.use('/api/v1/downloads', express.static(CONVERTED_DIR, {
-  setHeaders: (res) => {
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Cache-Control', 'no-cache');
-  },
-}));
+// Serve converted MP3s directly — frontend downloads from here
+app.use('/downloads', express.static(DOWNLOAD_DIR));
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use('/api', apiRateLimiter);
+app.get('/', (_req, res) => res.json({ status: 'ok' }));
+app.get('/health', (_req, res) => res.json({ status: 'healthy' }));
+
 app.use('/api/jobs', jobsRouter);
 app.use('/api/v1/convert', jobsRouter);
 
-app.get('/health', (_req: Request, res: Response) => {
-  res.json({ status: 'healthy', timestamp: new Date() });
-});
-
-app.get('/', (_req: Request, res: Response) => {
-  res.json({ status: 'Server is running', version: '1.0.0' });
-});
-
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-  console.error('Unhandled Server Error:', err);
-  res.status(err.status || 500).json({
-    error: err.message || 'An unexpected server error occurred.',
-    code: err.code || 'INTERNAL_SERVER_ERROR',
-  });
+  console.error(err);
+  res.status(500).json({ error: err.message || 'Server error' });
 });
 
-// ---------------------------------------------------------------------------
-// Start listening FIRST so Railway health checks pass immediately,
-// then init DB and queue in the background.
-// ---------------------------------------------------------------------------
-const server = app.listen(port, '0.0.0.0', () => {
-  console.log(`[SonicFlow Backend] Listening on 0.0.0.0:${port}`);
-
-  // Non-blocking background init — server is already accepting requests
-  Promise.resolve()
-    .then(() => initDatabase())
-    .then(() => {
-      initQueue();
-      console.log('[SonicFlow Backend] Database and queue ready.');
-    })
-    .catch((err) => {
-      console.error('[SonicFlow Backend] Background init error (non-fatal):', err.message);
-      // Don't crash — DB fallback is already handled inside initDatabase()
-    });
-});
-
-// Graceful shutdown on SIGTERM (Railway sends this before killing the container)
-process.on('SIGTERM', () => {
-  console.log('[SonicFlow Backend] SIGTERM received — shutting down gracefully...');
-  server.close(() => {
-    console.log('[SonicFlow Backend] HTTP server closed.');
-    process.exit(0);
-  });
-  // Force exit after 10s if connections don't drain
-  setTimeout(() => process.exit(0), 10_000).unref();
-});
-
-process.on('SIGINT', () => {
-  server.close(() => process.exit(0));
+// PORT BINDING FIRST — before any async work so Railway health check passes
+app.listen(port, '0.0.0.0', () => {
+  console.log(`[Backend] Listening on 0.0.0.0:${port}`);
 });
