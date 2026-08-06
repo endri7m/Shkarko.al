@@ -205,16 +205,39 @@ router.post('/url', uploadRateLimiter, ssrfProtection, async (req: Request, res:
  */
 router.get('/:id', async (req: Request, res: Response) => {
   try {
-    const job = await getJob(req.params.id);
+    const jobId = req.params.id;
+    const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
+    const downloadUrl = `${backendUrl}/api/jobs/${jobId}/download`;
+
+    // Check if the converted file already exists on disk — source of truth
+    const convertedPath = path.join('/tmp/shkarko-al/converted', `${jobId}.mp3`);
+    const fileExists = fs.existsSync(convertedPath);
+
+    const job = await getJob(jobId);
+
     if (!job) {
+      // If DB missed it but file exists, synthesize a COMPLETED response
+      if (fileExists) {
+        return res.json({ id: jobId, status: 'COMPLETED', progress: 100, s3Url: downloadUrl });
+      }
       return res.status(404).json({ error: 'Job not found.' });
     }
-    // Attach download URL if completed
-    const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
+
     const response: any = { ...job };
-    if (job.status === 'COMPLETED') {
-      response.s3Url = `${backendUrl}/api/jobs/${job.id}/download`;
+
+    // Force COMPLETED if file is on disk — overrides any DB lag
+    if (fileExists && (job.status === 'COMPLETED' || job.progress >= 99)) {
+      response.status = 'COMPLETED';
+      response.progress = 100;
+      response.s3Url = downloadUrl;
+      // Update DB silently so future polls are consistent
+      if (job.status !== 'COMPLETED') {
+        updateJobProgress(job.id, 100, 'COMPLETED').catch(() => {});
+      }
+    } else if (job.status === 'COMPLETED') {
+      response.s3Url = downloadUrl;
     }
+
     return res.json(response);
   } catch (err) {
     return res.status(500).json({ error: 'Failed to fetch job status.' });
@@ -304,7 +327,7 @@ router.get('/:id/progress', async (req: Request, res: Response) => {
  */
 router.get('/:id/download', async (req: Request, res: Response) => {
   const jobId = req.params.id;
-  const filePath = path.join(SCRATCH_DIR, 'converted', `${jobId}.mp3`);
+  const filePath = path.join('/tmp/shkarko-al/converted', `${jobId}.mp3`);
 
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({ error: 'Transcoded file not found or expired.' });
