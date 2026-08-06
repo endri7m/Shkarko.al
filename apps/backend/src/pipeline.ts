@@ -293,8 +293,23 @@ function transcodeFromFile(
       })
       .on('end', () => {
         try {
+          if (!fs.existsSync(outputPath)) {
+            return reject(new Error(`Output file not found: ${outputPath}`));
+          }
           const stats = fs.statSync(outputPath);
+
+          let probeSettled = false;
+          const probeTimeout = setTimeout(() => {
+            if (!probeSettled) {
+              probeSettled = true;
+              resolve({ outputPath, duration: totalDuration, fileSize: stats.size, title });
+            }
+          }, 5000);
+
           ffmpeg.ffprobe(outputPath, (err, meta) => {
+            if (probeSettled) return;
+            probeSettled = true;
+            clearTimeout(probeTimeout);
             resolve({
               outputPath,
               duration: (!err && meta?.format?.duration) ? Math.round(meta.format.duration) : totalDuration,
@@ -369,9 +384,17 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
 
   const transcodeResult = await new Promise<TranscodeResult>((resolve, reject) => {
     let totalDuration = 0;
+    let resolved = false;
+
+    const safeResolve = (result: TranscodeResult) => {
+      if (!resolved) { resolved = true; resolve(result); }
+    };
+    const safeReject = (err: Error) => {
+      if (!resolved) { resolved = true; reject(err); }
+    };
 
     ytDlpProc.on('error', (err: any) => {
-      reject(err.code === 'ENOENT'
+      safeReject(err.code === 'ENOENT'
         ? new Error('yt-dlp is not installed.')
         : new Error(`yt-dlp spawn error: ${err.message}`));
     });
@@ -413,11 +436,29 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
         await publishJobProgress(jobId, 'PROCESSING', percent);
       })
       .on('end', () => {
-        console.log(`[FFmpeg Job ${jobId}] Transcoding complete.`);
+        console.log(`[FFmpeg Job ${jobId}] Transcoding complete. Verifying output file...`);
         try {
+          if (!fs.existsSync(outputPath)) {
+            return safeReject(new Error(`Output file not found at: ${outputPath}`));
+          }
           const stats = fs.statSync(outputPath);
+          console.log(`[FFmpeg Job ${jobId}] Output file size: ${stats.size} bytes`);
+
+          // Use ffprobe with a hard timeout — don't let it hang
+          let probeSettled = false;
+          const probeTimeout = setTimeout(() => {
+            if (!probeSettled) {
+              probeSettled = true;
+              console.warn(`[FFmpeg Job ${jobId}] ffprobe timed out — using estimated duration`);
+              safeResolve({ outputPath, duration: totalDuration, fileSize: stats.size, title: metadataTitle });
+            }
+          }, 5000);
+
           ffmpeg.ffprobe(outputPath, (err, meta) => {
-            resolve({
+            if (probeSettled) return;
+            probeSettled = true;
+            clearTimeout(probeTimeout);
+            safeResolve({
               outputPath,
               duration: (!err && meta?.format?.duration) ? Math.round(meta.format.duration) : totalDuration,
               fileSize: stats.size,
@@ -425,24 +466,35 @@ export async function transcodeAudio(job: Job, options: TranscodeOptions): Promi
             });
           });
         } catch (e) {
-          reject(new Error(`Failed to stat output: ${(e as Error).message}`));
+          safeReject(new Error(`Failed to stat output: ${(e as Error).message}`));
         }
       })
       .on('error', (err) => {
         console.error(`[FFmpeg Job ${jobId}] Error: ${err.message}`);
         try { ytDlpProc.kill(); } catch {}
-        reject(err);
+        safeReject(err);
       })
       .save(outputPath);
   });
 
-  // Wait for metadata (max 3s) then embed
-  await Promise.race([metaPromise, new Promise(r => setTimeout(r, 3000))]);
-
-  if (metadataTitle !== 'Unknown Title' || thumbnailPath) {
-    await embedMetadata(outputPath, metadataTitle, metadataArtist, thumbnailPath);
+  // Wait for metadata (max 5s) then embed — skip entirely if it takes too long
+  try {
+    await Promise.race([metaPromise, new Promise(r => setTimeout(r, 5000))]);
+    if (metadataTitle !== 'Unknown Title' || thumbnailPath) {
+      await Promise.race([
+        embedMetadata(outputPath, metadataTitle, metadataArtist, thumbnailPath),
+        new Promise(r => setTimeout(r, 5000)), // hard 5s timeout on embed
+      ]);
+      console.log(`[FFmpeg Job ${jobId}] Metadata embedded.`);
+    }
+  } catch (e) {
+    console.warn(`[FFmpeg Job ${jobId}] Metadata embed failed (non-fatal):`, e);
   }
-  if (thumbnailPath && fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
 
+  if (thumbnailPath && fs.existsSync(thumbnailPath)) {
+    try { fs.unlinkSync(thumbnailPath); } catch {}
+  }
+
+  console.log(`[FFmpeg Job ${jobId}] Job fully complete. File: ${outputPath}`);
   return { ...transcodeResult, title: metadataTitle };
 }
