@@ -4,34 +4,31 @@ import { execFileSync, spawn } from 'child_process';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
 
-// ---------------------------------------------------------------------------
-// Directories & Cookies Setup
-// ---------------------------------------------------------------------------
 export const RAW_DIR       = '/tmp/shkarko-al/raw';
 export const CONVERTED_DIR = '/tmp/shkarko-al/converted';
-const COOKIE_FILE          = '/tmp/youtube-cookies.txt';
+const COOKIE_FILE          = '/tmp/cookies.txt';
 
 ['/tmp/shkarko-al', RAW_DIR, CONVERTED_DIR].forEach(d => {
   try { fs.mkdirSync(d, { recursive: true }); } catch {}
 });
 
-// Funksion për të shkruar cookies në disk nëse ekzistojnë në variabla
+// Funksion i përmirësuar për Cookies
 function getCookieFlag(): string[] {
   const content = process.env.YOUTUBE_COOKIES;
-  if (content && content.trim().length > 0) {
+  if (content && content.length > 50) {
     try {
       fs.writeFileSync(COOKIE_FILE, content.trim());
+      console.log(`[Pipeline] Cookies u shkruan në ${COOKIE_FILE} (${content.length} bytes)`);
       return ['--cookies', COOKIE_FILE];
     } catch (e) {
-      console.error('[Pipeline] Gabim gjatë shkrimit të cookies:', e);
+      console.error('[Pipeline] Gabim shkrimi cookies:', e);
     }
+  } else {
+    console.warn('[Pipeline] KUJDES: Variabla YOUTUBE_COOKIES është bosh ose shumë e shkurtër!');
   }
   return [];
 }
 
-// ---------------------------------------------------------------------------
-// Binary resolution
-// ---------------------------------------------------------------------------
 function resolveBin(candidates: string[]): string {
   for (const p of candidates) {
     if (p.startsWith('/') && fs.existsSync(p)) return p;
@@ -46,152 +43,88 @@ const ffmpegPath = resolveBin(['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', ffmpe
 const ytDlpPath  = resolveBin(['/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp', 'yt-dlp']);
 
 ffmpeg.setFfmpegPath(ffmpegPath);
-console.log(`[Pipeline] ffmpeg:  ${ffmpegPath}`);
-console.log(`[Pipeline] yt-dlp:  ${ytDlpPath}`);
 
-const UA      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-const REFERER = 'https://www.youtube.com/';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
 
-// ---------------------------------------------------------------------------
-// STEP 1 — Discovery
-// ---------------------------------------------------------------------------
-export async function discoverVideo(url: string): Promise<VideoMeta> {
+export async function discoverVideo(url: string): Promise<any> {
   return new Promise((resolve, reject) => {
     const out: Buffer[] = [];
     const err: Buffer[] = [];
+    const cookieArgs = getCookieFlag();
+
+    console.log(`[Discovery] Duke kërkuar metadata për: ${url}`);
 
     const proc = spawn(ytDlpPath, [
-      ...getCookieFlag(), // SHTIMI I COOKIES
+      ...cookieArgs,
       '--dump-json',
       '--simulate',
-      '--no-warnings',
       '--no-check-certificates',
-      '--prefer-free-formats',
-      '--extractor-args', 'youtube:player_client=ios,android',
       '--user-agent', UA,
-      '--referer', REFERER,
+      '--extractor-args', 'youtube:player_client=android,web',
       url,
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    ]);
 
-    proc.stdout!.on('data', (c: Buffer) => out.push(c));
-    proc.stderr!.on('data', (c: Buffer) => err.push(c));
+    proc.stdout!.on('data', (c) => out.push(c));
+    proc.stderr!.on('data', (c) => err.push(c));
 
+    // Rritim kohën në 60 sekonda sepse YouTube është i ngadaltë me serverat
     const timer = setTimeout(() => {
-      try { proc.kill('SIGKILL'); } catch {}
-      reject(new Error('Metadata fetch timed out after 30s'));
-    }, 30_000).unref();
-
-    proc.on('error', e => { clearTimeout(timer); reject(e); });
+      proc.kill('SIGKILL');
+      reject(new Error('YouTube nuk u përgjigj (Timeout 60s). Provo një link tjetër ose refresh Cookies.'));
+    }, 60_000);
 
     proc.on('close', code => {
       clearTimeout(timer);
       if (code !== 0) {
-        const msg = Buffer.concat(err).toString().slice(0, 400);
-        console.error(`[Discovery] yt-dlp exit ${code}: ${msg}`);
-        reject(new Error('YouTube kërkon identifikim (Cookies mungojnë ose janë të vjetra).'));
+        const errorMsg = Buffer.concat(err).toString();
+        console.error(`[Discovery] yt-dlp error:`, errorMsg);
+        reject(new Error('YouTube bllokoi kërkesën. Sigurohu që Cookies te Railway janë të saktë.'));
         return;
       }
       try {
-        const raw = Buffer.concat(out).toString('utf8').trim();
-        const json = JSON.parse(raw);
+        const json = JSON.parse(Buffer.concat(out).toString());
         resolve({
-          title:     json.title     || 'Unknown Title',
-          thumbnail: json.thumbnail || null,
-          duration:  Math.round(json.duration || 0),
-          uploader:  json.uploader  || json.channel || 'Unknown Artist',
+          title: json.title,
+          thumbnail: json.thumbnail,
+          duration: json.duration,
+          uploader: json.uploader
         });
-      } catch {
-        reject(new Error('Failed to parse video metadata'));
+      } catch (e) {
+        reject(new Error('Dështoi leximi i të dhënave të videos.'));
       }
     });
   });
 }
 
-// ---------------------------------------------------------------------------
-// STEP 2 — Download raw audio
-// ---------------------------------------------------------------------------
-export function downloadAudio(url: string, rawPath: string): Promise<void> {
+export async function downloadAudio(url: string, rawPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    console.log(`[Download] Starting → ${rawPath}`);
-
+    const cookieArgs = getCookieFlag();
     const proc = spawn(ytDlpPath, [
-      ...getCookieFlag(), // SHTIMI I COOKIES
-      '-f', 'bestaudio[ext=m4a]/bestaudio/best',
-      '--no-warnings', '--no-progress',
-      '--no-check-certificates',
-      '--extractor-args', 'youtube:player_client=ios,android',
+      ...cookieArgs,
+      '-f', 'bestaudio[ext=m4a]/bestaudio',
       '--user-agent', UA,
-      '--referer', REFERER,
-      '--limit-rate', '5M',
       '-o', rawPath,
-      url,
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+      url
+    ]);
 
-    proc.stdout!.on('data', (c: Buffer) => process.stdout.write(`[yt-dlp] ${c}`));
-    proc.stderr!.on('data', (c: Buffer) => process.stdout.write(`[yt-dlp] ${c}`));
-
-    const timer = setTimeout(() => {
-      try { proc.kill('SIGKILL'); } catch {}
-      reject(new Error('Download timed out after 8 minutes'));
-    }, 8 * 60_000).unref();
-
-    proc.on('error', e => { clearTimeout(timer); reject(e); });
+    const timer = setTimeout(() => { proc.kill('SIGKILL'); reject(new Error('Shkarkimi zgjati shumë.')); }, 300_000);
 
     proc.on('close', code => {
       clearTimeout(timer);
-      if (code !== 0) { reject(new Error(`Shkarkimi dështoi (Code ${code})`)); return; }
-      if (!fs.existsSync(rawPath)) { reject(new Error(`Skedari nuk u gjet.`)); return; }
-      resolve();
+      if (code === 0) resolve();
+      else reject(new Error('Shkarkimi dështoi.'));
     });
   });
 }
 
-// ---------------------------------------------------------------------------
-// STEP 3 — Convert to MP3
-// ---------------------------------------------------------------------------
-export function convertToMp3(
-  inputPath: string,
-  outputPath: string,
-  bitrate: number,
-  sampleRate: number,
-  onProgress: (pct: number) => void
-): Promise<number> {
+export async function convertToMp3(input: string, output: string, bitrate: number, rate: number, onProgress: any): Promise<number> {
   return new Promise((resolve, reject) => {
-    let duration = 0;
-    let settled  = false;
-    const done = (size: number) => { if (!settled) { settled = true; resolve(size); } };
-    const fail = (e: Error)     => { if (!settled) { settled = true; reject(e); } };
-
-    ffmpeg(inputPath)
+    ffmpeg(input)
       .audioCodec('libmp3lame')
       .audioBitrate(bitrate)
-      .audioFrequency(sampleRate)
-      .audioChannels(2)
-      .outputOptions(['-vn', '-threads', '0'])
-      .on('codecData', d => { if (d.duration) duration = parseSecs(d.duration); })
-      .on('progress', p => {
-        let pct = 0;
-        if (p.percent !== undefined && p.percent > 0) pct = Math.round(p.percent);
-        else if (duration > 0 && p.timemark) pct = Math.round((parseSecs(p.timemark) / duration) * 100);
-        onProgress(Math.max(1, Math.min(99, pct)));
-      })
-      .on('end', () => {
-        setImmediate(() => {
-          const size = fs.existsSync(outputPath) ? fs.statSync(outputPath).size : 0;
-          done(size);
-        });
-      })
-      .on('error', err => fail(err))
-      .save(outputPath);
+      .on('progress', p => onProgress(Math.round(p.percent || 0)))
+      .on('end', () => resolve(fs.statSync(output).size))
+      .on('error', e => reject(e))
+      .save(output);
   });
 }
-
-function parseSecs(s: string): number {
-  try {
-    const p = s.split(':');
-    if (p.length === 3) return parseFloat(p[0]) * 3600 + parseFloat(p[1]) * 60 + parseFloat(p[2]);
-    return parseFloat(s) || 0;
-  } catch { return 0; }
-}
-
-export interface VideoMeta { title: string; thumbnail: string | null; duration: number; uploader: string; }
