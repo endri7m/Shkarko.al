@@ -5,14 +5,29 @@ import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
 
 // ---------------------------------------------------------------------------
-// Directories
+// Directories & Cookies Setup
 // ---------------------------------------------------------------------------
 export const RAW_DIR       = '/tmp/shkarko-al/raw';
 export const CONVERTED_DIR = '/tmp/shkarko-al/converted';
+const COOKIE_FILE          = '/tmp/youtube-cookies.txt';
 
 ['/tmp/shkarko-al', RAW_DIR, CONVERTED_DIR].forEach(d => {
   try { fs.mkdirSync(d, { recursive: true }); } catch {}
 });
+
+// Funksion për të shkruar cookies në disk nëse ekzistojnë në variabla
+function getCookieFlag(): string[] {
+  const content = process.env.YOUTUBE_COOKIES;
+  if (content && content.trim().length > 0) {
+    try {
+      fs.writeFileSync(COOKIE_FILE, content.trim());
+      return ['--cookies', COOKIE_FILE];
+    } catch (e) {
+      console.error('[Pipeline] Gabim gjatë shkrimit të cookies:', e);
+    }
+  }
+  return [];
+}
 
 // ---------------------------------------------------------------------------
 // Binary resolution
@@ -38,25 +53,7 @@ const UA      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (K
 const REFERER = 'https://www.youtube.com/';
 
 // ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-export interface VideoMeta {
-  title: string;
-  thumbnail: string | null;
-  duration: number; // seconds
-  uploader: string;
-}
-
-export interface ConvertResult {
-  outputPath: string;
-  fileSize: number;
-  title: string;
-  thumbnail: string | null;
-  duration: number;
-}
-
-// ---------------------------------------------------------------------------
-// STEP 1 — Discovery: fetch metadata only, no download
+// STEP 1 — Discovery
 // ---------------------------------------------------------------------------
 export async function discoverVideo(url: string): Promise<VideoMeta> {
   return new Promise((resolve, reject) => {
@@ -64,6 +61,7 @@ export async function discoverVideo(url: string): Promise<VideoMeta> {
     const err: Buffer[] = [];
 
     const proc = spawn(ytDlpPath, [
+      ...getCookieFlag(), // SHTIMI I COOKIES
       '--dump-json',
       '--simulate',
       '--no-warnings',
@@ -90,7 +88,7 @@ export async function discoverVideo(url: string): Promise<VideoMeta> {
       if (code !== 0) {
         const msg = Buffer.concat(err).toString().slice(0, 400);
         console.error(`[Discovery] yt-dlp exit ${code}: ${msg}`);
-        reject(new Error('YouTube has restricted access. Retrying...'));
+        reject(new Error('YouTube kërkon identifikim (Cookies mungojnë ose janë të vjetra).'));
         return;
       }
       try {
@@ -110,13 +108,14 @@ export async function discoverVideo(url: string): Promise<VideoMeta> {
 }
 
 // ---------------------------------------------------------------------------
-// STEP 2 — Download raw audio to disk
+// STEP 2 — Download raw audio
 // ---------------------------------------------------------------------------
 export function downloadAudio(url: string, rawPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     console.log(`[Download] Starting → ${rawPath}`);
 
     const proc = spawn(ytDlpPath, [
+      ...getCookieFlag(), // SHTIMI I COOKIES
       '-f', 'bestaudio[ext=m4a]/bestaudio/best',
       '--no-warnings', '--no-progress',
       '--no-check-certificates',
@@ -140,20 +139,15 @@ export function downloadAudio(url: string, rawPath: string): Promise<void> {
 
     proc.on('close', code => {
       clearTimeout(timer);
-      if (code !== 0) { reject(new Error(`yt-dlp download failed (code ${code})`)); return; }
-
-      if (!fs.existsSync(rawPath)) { reject(new Error(`Raw file not found: ${rawPath}`)); return; }
-      const size = fs.statSync(rawPath).size;
-      console.log(`[Download] Complete. Raw size: ${size} bytes`);
-      if (size === 0) { reject(new Error('Downloaded file is 0 bytes')); return; }
-
+      if (code !== 0) { reject(new Error(`Shkarkimi dështoi (Code ${code})`)); return; }
+      if (!fs.existsSync(rawPath)) { reject(new Error(`Skedari nuk u gjet.`)); return; }
       resolve();
     });
   });
 }
 
 // ---------------------------------------------------------------------------
-// STEP 3 — Convert raw file to MP3
+// STEP 3 — Convert to MP3
 // ---------------------------------------------------------------------------
 export function convertToMp3(
   inputPath: string,
@@ -161,11 +155,10 @@ export function convertToMp3(
   bitrate: number,
   sampleRate: number,
   onProgress: (pct: number) => void
-): Promise<number> { // returns fileSize
+): Promise<number> {
   return new Promise((resolve, reject) => {
     let duration = 0;
     let settled  = false;
-
     const done = (size: number) => { if (!settled) { settled = true; resolve(size); } };
     const fail = (e: Error)     => { if (!settled) { settled = true; reject(e); } };
 
@@ -175,10 +168,7 @@ export function convertToMp3(
       .audioFrequency(sampleRate)
       .audioChannels(2)
       .outputOptions(['-vn', '-threads', '0'])
-      .on('start', cmd => console.log(`[FFmpeg] ${cmd}`))
-      .on('codecData', d => {
-        if (d.duration) duration = parseSecs(d.duration);
-      })
+      .on('codecData', d => { if (d.duration) duration = parseSecs(d.duration); })
       .on('progress', p => {
         let pct = 0;
         if (p.percent !== undefined && p.percent > 0) pct = Math.round(p.percent);
@@ -187,15 +177,11 @@ export function convertToMp3(
       })
       .on('end', () => {
         setImmediate(() => {
-          try {
-            const size = fs.existsSync(outputPath) ? fs.statSync(outputPath).size : 0;
-            console.log(`[FFmpeg] Done. Size: ${size} bytes`);
-            if (size === 0) { fail(new Error('FFmpeg produced a 0-byte output file')); return; }
-            done(size);
-          } catch (e) { fail(e as Error); }
+          const size = fs.existsSync(outputPath) ? fs.statSync(outputPath).size : 0;
+          done(size);
         });
       })
-      .on('error', err => { console.error(`[FFmpeg] ${err.message}`); fail(err); })
+      .on('error', err => fail(err))
       .save(outputPath);
   });
 }
@@ -207,3 +193,5 @@ function parseSecs(s: string): number {
     return parseFloat(s) || 0;
   } catch { return 0; }
 }
+
+export interface VideoMeta { title: string; thumbnail: string | null; duration: number; uploader: string; }
