@@ -26,7 +26,7 @@ export default function Home() {
     convertUrl(url, bitrate, sampleRate);
   };
 
-  const isConverting = ['submitting', 'queued', 'processing'].includes(status);
+  const isConverting = ['submitting', 'queued', 'discovering', 'downloading', 'processing'].includes(status);
 
   return (
     <div className="min-h-screen relative flex flex-col justify-between overflow-hidden">
@@ -130,7 +130,6 @@ export default function Home() {
           <div className="w-full">
             {status === 'idle' && (
               <div className="space-y-6">
-                {/* Inputs Switcher */}
                 <div>
                   <UrlInput onSubmitUrl={handleUrlSubmit} disabled={false} />
                 </div>
@@ -138,15 +137,35 @@ export default function Home() {
             )}
 
             {/* Processing and Error States */}
-            {['submitting', 'queued', 'processing', 'failed'].includes(status) && (
-              <Console
-                status={status}
-                progress={progress}
-                filename={metadata.filename || 'Skedari audio'}
-                errorMessage={errorMessage}
-                onRetry={reset}
-                sourceType="URL"
-              />
+            {['submitting', 'queued', 'discovering', 'downloading', 'processing', 'failed'].includes(status) && (
+              <div className="space-y-4">
+                {/* Thumbnail + title card — appears as soon as discovery completes */}
+                {metadata.title && metadata.thumbnail && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="flex items-center gap-3 glass-panel rounded-xl p-3 border border-white/5"
+                  >
+                    <img
+                      src={metadata.thumbnail}
+                      alt={metadata.title}
+                      className="w-14 h-14 rounded-lg object-cover shrink-0"
+                    />
+                    <div className="min-w-0">
+                      <p className="text-xs text-gray-400 font-mono mb-0.5">U gjet:</p>
+                      <p className="text-sm font-semibold text-white truncate">{metadata.title}</p>
+                    </div>
+                  </motion.div>
+                )}
+                <Console
+                  status={status}
+                  progress={progress}
+                  filename={metadata.title || metadata.filename || 'Skedari audio'}
+                  errorMessage={errorMessage}
+                  onRetry={reset}
+                  sourceType="URL"
+                />
+              </div>
             )}
 
             {/* Completed Preview / Download */}

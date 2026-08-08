@@ -5,11 +5,14 @@ import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
 
 // ---------------------------------------------------------------------------
-// Dirs
+// Directories
 // ---------------------------------------------------------------------------
-const RAW_DIR       = '/tmp/raw';
-const CONVERTED_DIR = '/tmp/converted';
-[RAW_DIR, CONVERTED_DIR].forEach(d => { try { fs.mkdirSync(d, { recursive: true }); } catch {} });
+export const RAW_DIR       = '/tmp/shkarko-al/raw';
+export const CONVERTED_DIR = '/tmp/shkarko-al/converted';
+
+['/tmp/shkarko-al', RAW_DIR, CONVERTED_DIR].forEach(d => {
+  try { fs.mkdirSync(d, { recursive: true }); } catch {}
+});
 
 // ---------------------------------------------------------------------------
 // Binary resolution
@@ -28,55 +31,154 @@ const ffmpegPath = resolveBin(['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', ffmpe
 const ytDlpPath  = resolveBin(['/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp', 'yt-dlp']);
 
 ffmpeg.setFfmpegPath(ffmpegPath);
-console.log(`[Pipeline] ffmpeg: ${ffmpegPath}`);
-console.log(`[Pipeline] yt-dlp: ${ytDlpPath}`);
+console.log(`[Pipeline] ffmpeg:  ${ffmpegPath}`);
+console.log(`[Pipeline] yt-dlp:  ${ytDlpPath}`);
 
 const UA      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const REFERER = 'https://www.youtube.com/';
 
 // ---------------------------------------------------------------------------
-// Helper: run a process, resolve on exit 0, reject otherwise
+// Types
 // ---------------------------------------------------------------------------
-function run(bin: string, args: string[], label: string, timeoutMs: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    console.log(`[${label}] ${bin} ${args.join(' ')}`);
-    const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+export interface VideoMeta {
+  title: string;
+  thumbnail: string | null;
+  duration: number; // seconds
+  uploader: string;
+}
 
-    proc.stdout!.on('data', (c: Buffer) => process.stdout.write(`[${label}] ${c}`));
-    proc.stderr!.on('data', (c: Buffer) => process.stdout.write(`[${label}] ${c}`));
+export interface ConvertResult {
+  outputPath: string;
+  fileSize: number;
+  title: string;
+  thumbnail: string | null;
+  duration: number;
+}
+
+// ---------------------------------------------------------------------------
+// STEP 1 — Discovery: fetch metadata only, no download
+// ---------------------------------------------------------------------------
+export async function discoverVideo(url: string): Promise<VideoMeta> {
+  return new Promise((resolve, reject) => {
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+
+    const proc = spawn(ytDlpPath, [
+      '--dump-json',
+      '--simulate',
+      '--no-warnings',
+      '--no-check-certificates',
+      '--prefer-free-formats',
+      '--extractor-args', 'youtube:player_client=ios,android',
+      '--user-agent', UA,
+      '--referer', REFERER,
+      url,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    proc.stdout!.on('data', (c: Buffer) => out.push(c));
+    proc.stderr!.on('data', (c: Buffer) => err.push(c));
 
     const timer = setTimeout(() => {
       try { proc.kill('SIGKILL'); } catch {}
-      reject(new Error(`${label} timed out after ${timeoutMs / 1000}s`));
-    }, timeoutMs).unref();
+      reject(new Error('Metadata fetch timed out after 30s'));
+    }, 30_000).unref();
 
-    proc.on('error', err => { clearTimeout(timer); reject(err); });
+    proc.on('error', e => { clearTimeout(timer); reject(e); });
+
     proc.on('close', code => {
       clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(`${label} exited with code ${code}`));
+      if (code !== 0) {
+        const msg = Buffer.concat(err).toString().slice(0, 400);
+        console.error(`[Discovery] yt-dlp exit ${code}: ${msg}`);
+        reject(new Error('YouTube has restricted access. Retrying...'));
+        return;
+      }
+      try {
+        const raw = Buffer.concat(out).toString('utf8').trim();
+        const json = JSON.parse(raw);
+        resolve({
+          title:     json.title     || 'Unknown Title',
+          thumbnail: json.thumbnail || null,
+          duration:  Math.round(json.duration || 0),
+          uploader:  json.uploader  || json.channel || 'Unknown Artist',
+        });
+      } catch {
+        reject(new Error('Failed to parse video metadata'));
+      }
     });
   });
 }
 
 // ---------------------------------------------------------------------------
-// Helper: ffmpeg conversion via fluent-ffmpeg
+// STEP 2 — Download raw audio to disk
 // ---------------------------------------------------------------------------
-function convertFile(
-  input: string,
-  output: string,
+export function downloadAudio(url: string, rawPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    console.log(`[Download] Starting → ${rawPath}`);
+
+    const proc = spawn(ytDlpPath, [
+      '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+      '--no-warnings', '--no-progress',
+      '--no-check-certificates',
+      '--extractor-args', 'youtube:player_client=ios,android',
+      '--user-agent', UA,
+      '--referer', REFERER,
+      '--limit-rate', '5M',
+      '-o', rawPath,
+      url,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    proc.stdout!.on('data', (c: Buffer) => process.stdout.write(`[yt-dlp] ${c}`));
+    proc.stderr!.on('data', (c: Buffer) => process.stdout.write(`[yt-dlp] ${c}`));
+
+    const timer = setTimeout(() => {
+      try { proc.kill('SIGKILL'); } catch {}
+      reject(new Error('Download timed out after 8 minutes'));
+    }, 8 * 60_000).unref();
+
+    proc.on('error', e => { clearTimeout(timer); reject(e); });
+
+    proc.on('close', code => {
+      clearTimeout(timer);
+      if (code !== 0) { reject(new Error(`yt-dlp download failed (code ${code})`)); return; }
+
+      if (!fs.existsSync(rawPath)) { reject(new Error(`Raw file not found: ${rawPath}`)); return; }
+      const size = fs.statSync(rawPath).size;
+      console.log(`[Download] Complete. Raw size: ${size} bytes`);
+      if (size === 0) { reject(new Error('Downloaded file is 0 bytes')); return; }
+
+      resolve();
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// STEP 3 — Convert raw file to MP3
+// ---------------------------------------------------------------------------
+export function convertToMp3(
+  inputPath: string,
+  outputPath: string,
   bitrate: number,
   sampleRate: number,
   onProgress: (pct: number) => void
-): Promise<void> {
+): Promise<number> { // returns fileSize
   return new Promise((resolve, reject) => {
     let duration = 0;
-    ffmpeg(input)
+    let settled  = false;
+
+    const done = (size: number) => { if (!settled) { settled = true; resolve(size); } };
+    const fail = (e: Error)     => { if (!settled) { settled = true; reject(e); } };
+
+    ffmpeg(inputPath)
       .audioCodec('libmp3lame')
       .audioBitrate(bitrate)
       .audioFrequency(sampleRate)
+      .audioChannels(2)
       .outputOptions(['-vn', '-threads', '0'])
-      .on('codecData', d => { if (d.duration) duration = parseSecs(d.duration); })
+      .on('start', cmd => console.log(`[FFmpeg] ${cmd}`))
+      .on('codecData', d => {
+        if (d.duration) duration = parseSecs(d.duration);
+      })
       .on('progress', p => {
         let pct = 0;
         if (p.percent !== undefined && p.percent > 0) pct = Math.round(p.percent);
@@ -85,16 +187,16 @@ function convertFile(
       })
       .on('end', () => {
         setImmediate(() => {
-          const size = fs.existsSync(output) ? fs.statSync(output).size : 0;
-          console.log(`[FFmpeg] Done. Output size: ${size} bytes`);
-          resolve();
+          try {
+            const size = fs.existsSync(outputPath) ? fs.statSync(outputPath).size : 0;
+            console.log(`[FFmpeg] Done. Size: ${size} bytes`);
+            if (size === 0) { fail(new Error('FFmpeg produced a 0-byte output file')); return; }
+            done(size);
+          } catch (e) { fail(e as Error); }
         });
       })
-      .on('error', err => {
-        console.error(`[FFmpeg] Error: ${err.message}`);
-        reject(err);
-      })
-      .save(output);
+      .on('error', err => { console.error(`[FFmpeg] ${err.message}`); fail(err); })
+      .save(outputPath);
   });
 }
 
@@ -104,102 +206,4 @@ function parseSecs(s: string): number {
     if (p.length === 3) return parseFloat(p[0]) * 3600 + parseFloat(p[1]) * 60 + parseFloat(p[2]);
     return parseFloat(s) || 0;
   } catch { return 0; }
-}
-
-// ---------------------------------------------------------------------------
-// Main: sequential download → convert
-// ---------------------------------------------------------------------------
-export interface ConvertResult {
-  outputPath: string;
-  fileSize: number;
-  title: string;
-}
-
-export async function processJob(
-  jobId: string,
-  sourceUrl: string,
-  bitrate: number,
-  sampleRate: number,
-  onProgress: (pct: number) => void
-): Promise<ConvertResult> {
-
-  const rawPath    = path.join(RAW_DIR,       `${jobId}.m4a`);
-  const outputPath = path.join(CONVERTED_DIR, `${jobId}.mp3`);
-
-  // Clean up any leftovers from previous attempts
-  [rawPath, outputPath].forEach(f => { try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {} });
-
-  // Wrap entire operation in a 5-minute timeout
-  const TIMEOUT = 5 * 60_000;
-  return Promise.race([
-    _processJob(jobId, sourceUrl, bitrate, sampleRate, rawPath, outputPath, onProgress),
-    new Promise<ConvertResult>((_, reject) =>
-      setTimeout(() => reject(new Error('Job timed out after 5 minutes')), TIMEOUT).unref()
-    ),
-  ]);
-}
-
-async function _processJob(
-  jobId: string,
-  sourceUrl: string,
-  bitrate: number,
-  sampleRate: number,
-  rawPath: string,
-  outputPath: string,
-  onProgress: (pct: number) => void
-): Promise<ConvertResult> {
-
-  // ── STEP 1: Get title (best-effort, 20s timeout) ──────────────────────────
-  let title = 'Unknown Title';
-  try {
-    const { execFileSync: exec } = await import('child_process');
-    const meta = exec(ytDlpPath, [
-      '--no-warnings', '--quiet', '-j',
-      '--extractor-args', 'youtube:player_client=ios,android',
-      '--user-agent', UA, '--referer', REFERER,
-      sourceUrl,
-    ], { timeout: 20_000 }).toString();
-    const parsed = JSON.parse(meta.trim());
-    title = parsed.title || title;
-    console.log(`[Pipeline ${jobId}] Title: "${title}"`);
-  } catch (e) {
-    console.warn(`[Pipeline ${jobId}] Could not fetch title:`, (e as Error).message);
-  }
-
-  onProgress(5);
-
-  // ── STEP 2: Download raw audio to disk ────────────────────────────────────
-  console.log(`[Pipeline ${jobId}] Downloading to ${rawPath}`);
-  await run(ytDlpPath, [
-    '-f', 'bestaudio[ext=m4a]/bestaudio/best',
-    '--no-warnings', '--no-progress',
-    '--extractor-args', 'youtube:player_client=ios,android',
-    '--user-agent', UA,
-    '--referer', REFERER,
-    '-o', rawPath,
-    sourceUrl,
-  ], `yt-dlp ${jobId}`, 4 * 60_000);
-
-  // Verify raw file
-  if (!fs.existsSync(rawPath)) throw new Error(`Raw file not found after download: ${rawPath}`);
-  const rawSize = fs.statSync(rawPath).size;
-  console.log(`[Pipeline ${jobId}] Raw file size: ${rawSize} bytes`);
-  if (rawSize === 0) throw new Error('Downloaded file is 0 bytes — yt-dlp produced no output');
-
-  onProgress(40);
-
-  // ── STEP 3: Convert to MP3 ────────────────────────────────────────────────
-  console.log(`[Pipeline ${jobId}] Converting ${rawPath} → ${outputPath}`);
-  await convertFile(rawPath, outputPath, bitrate, sampleRate, onProgress);
-
-  // Verify output
-  if (!fs.existsSync(outputPath)) throw new Error(`Output MP3 not found: ${outputPath}`);
-  const fileSize = fs.statSync(outputPath).size;
-  if (fileSize === 0) throw new Error('Converted MP3 is 0 bytes');
-
-  // Clean up raw file
-  try { fs.unlinkSync(rawPath); } catch {}
-
-  console.log(`[Pipeline ${jobId}] Complete. MP3 size: ${fileSize} bytes`);
-  return { outputPath, fileSize, title };
 }
