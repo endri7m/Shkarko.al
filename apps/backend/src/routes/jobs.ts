@@ -109,7 +109,10 @@ async function runJob(
     job.progress = 15;
     console.log(`[Jobs] ${jobId} DOWNLOADING`);
 
-    await downloadAudio(url, rawPath);
+    await downloadAudio(url, rawPath, (dlPct: number) => {
+      // Map download 0-100 into job progress 15-45
+      job.progress = Math.round(15 + dlPct * 0.30);
+    });
     job.progress = 45;
 
     // ── STEP 3: Convert ────────────────────────────────────────────────────
