@@ -57,9 +57,9 @@ export function useConversion() {
     setProgress(pct);
 
     if (mapped === 'completed') {
-      // Build download URL — prefer what server returns, fallback to constructing it
+      // s3Url → audio player src, downloadUrl → download button href
       const downloadUrl = data.s3Url || data.downloadUrl || null;
-      console.log('[useConversion] COMPLETED. Download URL:', downloadUrl);
+      console.log('[useConversion] COMPLETED. Play URL:', data.s3Url, '| Download URL:', data.downloadUrl);
       setS3Url(downloadUrl);
       setProgress(100);
       setMetadata(prev => ({

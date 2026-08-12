@@ -5,16 +5,17 @@ import { motion } from 'framer-motion';
 import { Play, Pause, Download, Volume2, VolumeX, FileAudio, RotateCcw, Clock } from 'lucide-react';
 
 interface PlayerProps {
-  s3Url: string;
+  s3Url: string;       // used for <audio src> — in-browser playback
+  downloadUrl?: string; // used for download button — triggers filename dialog
   filename: string;
-  duration: number; // in seconds
-  fileSize: number; // in bytes
+  duration: number;
+  fileSize: number;
   bitrate: number;
   sampleRate: number;
   onReset: () => void;
 }
 
-export default function Player({ s3Url, filename, duration, fileSize, bitrate, sampleRate, onReset }: PlayerProps) {
+export default function Player({ s3Url, downloadUrl, filename, duration, fileSize, bitrate, sampleRate, onReset }: PlayerProps) {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [volume, setVolume] = useState(0.8);
@@ -200,8 +201,8 @@ export default function Player({ s3Url, filename, duration, fileSize, bitrate, s
       {/* Action panel (Download / Convert Again) */}
       <div className="grid grid-cols-2 gap-4">
         <a
-          href={s3Url}
-          download={filename.replace(/\.[^/.]+$/, "") + ".mp3"}
+          href={downloadUrl || s3Url}
+          download={filename.replace(/\.[^/.]+$/, '') + '.mp3'}
           className="flex items-center justify-center gap-2 py-3.5 bg-gradient-to-r from-brand-purple to-brand-glow text-white text-sm font-semibold rounded-xl shadow-glass-glow hover:opacity-90 active:scale-[0.98] transition-all text-center cursor-pointer"
         >
           <Download className="w-4 h-4" />
