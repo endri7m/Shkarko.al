@@ -2,14 +2,13 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import dotenv from 'dotenv';
+import { initCookies } from './pipeline';
 import jobsRouter from './routes/jobs';
 
 dotenv.config();
 
-// Ensure download dir exists
-const DOWNLOAD_DIR = '/tmp/converted';
-try { fs.mkdirSync(DOWNLOAD_DIR, { recursive: true }); } catch {}
-try { fs.mkdirSync('/tmp/raw', { recursive: true }); } catch {}
+// Write YouTube cookies from env var to disk immediately after env is loaded
+initCookies();
 
 const app = express();
 const port = Number(process.env.PORT) || 5000;
@@ -18,8 +17,8 @@ app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Serve converted MP3s directly — frontend downloads from here
-app.use('/downloads', express.static(DOWNLOAD_DIR));
+// Serve converted MP3s directly — must match CONVERTED_DIR in pipeline.ts
+app.use('/downloads', express.static('/tmp/shkarko-al/converted'));
 
 app.get('/', (_req, res) => res.json({ status: 'ok' }));
 app.get('/health', (_req, res) => res.json({ status: 'healthy' }));
