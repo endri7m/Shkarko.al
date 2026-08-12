@@ -71,6 +71,14 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 console.log(`[Pipeline] ffmpeg:  ${ffmpegPath}`);
 console.log(`[Pipeline] yt-dlp:  ${ytDlpPath}`);
 
+// Verify yt-dlp actually runs at startup
+try {
+  const ver = execFileSync(ytDlpPath, ['--version'], { timeout: 5000 }).toString().trim();
+  console.log(`[Pipeline] yt-dlp version: ${ver}`);
+} catch (e) {
+  console.error(`[Pipeline] yt-dlp --version FAILED:`, (e as Error).message);
+}
+
 // ---------------------------------------------------------------------------
 // Shared yt-dlp base flags
 // ---------------------------------------------------------------------------
@@ -83,6 +91,8 @@ function baseArgs(): string[] {
     '--no-warnings',
     '--no-check-certificates',
     '--force-ipv4',
+    '--socket-timeout', '30',       // fail fast if no response in 30s
+    '--retries', '2',               // retry twice then give up
     '--user-agent', UA,
     '--referer',    REFERER,
     '--extractor-args', 'youtube:player_client=android,web;player_skip=webpage,configs',
@@ -159,8 +169,10 @@ function runYtDlp(args: string[], label: string, timeoutMs: number): Promise<str
 // STEP 1 — Discovery
 // ---------------------------------------------------------------------------
 export async function discoverVideo(url: string): Promise<VideoMeta> {
+  // Use -j without --simulate so yt-dlp makes a real but metadata-only request
+  // --simulate still requires full page load which can hang on blocked IPs
   const stdout = await runYtDlp(
-    ['--dump-json', '--simulate', '--no-progress', ...baseArgs(), url],
+    ['-j', '--no-playlist', '--no-progress', ...baseArgs(), url],
     'Discovery',
     90_000
   );
