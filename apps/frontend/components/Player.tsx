@@ -6,6 +6,7 @@ import { Play, Pause, Download, Volume2, VolumeX, FileAudio, RotateCcw, Clock } 
 
 interface PlayerProps {
   s3Url: string;
+  downloadUrl: string;
   filename: string;
   duration: number; // in seconds
   fileSize: number; // in bytes
@@ -14,7 +15,7 @@ interface PlayerProps {
   onReset: () => void;
 }
 
-export default function Player({ s3Url, filename, duration, fileSize, bitrate, sampleRate, onReset }: PlayerProps) {
+export default function Player({ s3Url, downloadUrl, filename, duration, fileSize, bitrate, sampleRate, onReset }: PlayerProps) {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [volume, setVolume] = useState(0.8);
@@ -200,7 +201,7 @@ export default function Player({ s3Url, filename, duration, fileSize, bitrate, s
       {/* Action panel (Download / Convert Again) */}
       <div className="grid grid-cols-2 gap-4">
         <a
-          href={s3Url}
+          href={downloadUrl}
           download={filename.replace(/\.[^/.]+$/, "") + ".mp3"}
           className="flex items-center justify-center gap-2 py-3.5 bg-gradient-to-r from-brand-purple to-brand-glow text-white text-sm font-semibold rounded-xl shadow-glass-glow hover:opacity-90 active:scale-[0.98] transition-all text-center cursor-pointer"
         >

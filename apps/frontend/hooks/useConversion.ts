@@ -28,6 +28,7 @@ export function useConversion() {
   const [progress,     setProgress]     = useState<number>(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [s3Url,        setS3Url]        = useState<string | null>(null);
+  const [downloadUrl,  setDownloadUrl]  = useState<string | null>(null);
   const [metadata,     setMetadata]     = useState<JobMetadata>({});
 
   const pollRef     = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -43,6 +44,7 @@ export function useConversion() {
     setProgress(0);
     setErrorMessage(null);
     setS3Url(null);
+    setDownloadUrl(null);
     setMetadata({});
   }, [stopPolling]);
 
@@ -58,9 +60,10 @@ export function useConversion() {
 
     if (mapped === 'completed') {
       // Build download URL — prefer what server returns, fallback to constructing it
-      const downloadUrl = data.s3Url || data.downloadUrl || null;
-      console.log('[useConversion] COMPLETED. Download URL:', downloadUrl);
-      setS3Url(downloadUrl);
+      const completedUrl = data.s3Url || data.downloadUrl || null;
+      console.log('[useConversion] COMPLETED. Download URL:', completedUrl);
+      setS3Url(data.s3Url || data.downloadUrl || null);
+      setDownloadUrl(data.downloadUrl || data.s3Url || null);
       setProgress(100);
       setMetadata(prev => ({
         ...prev,
@@ -151,5 +154,5 @@ export function useConversion() {
     }
   }, [reset, startPolling]);
 
-  return { status, progress, errorMessage, s3Url, metadata, convertUrl, convertFile, reset };
+  return { status, progress, errorMessage, s3Url, downloadUrl, metadata, convertUrl, convertFile, reset };
 }

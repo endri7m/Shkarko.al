@@ -5,7 +5,21 @@ import path from 'path';
 import { discoverVideo, downloadAudio, convertToMp3, CONVERTED_DIR, RAW_DIR } from '../pipeline';
 
 const router = Router();
-const BACKEND_URL = () => process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
+
+export function getBackendUrl(req: Request): string {
+  const configuredUrl = process.env.BACKEND_URL?.trim().replace(/\/$/, '');
+  if (configuredUrl) {
+    return /^https?:\/\//i.test(configuredUrl)
+      ? configuredUrl
+      : `https://${configuredUrl}`;
+  }
+
+  const forwardedProtocol = req.get('x-forwarded-proto')?.split(',')[0].trim();
+  const forwardedHost = req.get('x-forwarded-host')?.split(',')[0].trim();
+  const protocol = forwardedProtocol || req.protocol;
+  const host = forwardedHost || req.get('host') || `localhost:${process.env.PORT || 5000}`;
+  return `${protocol}://${host}`;
+}
 
 // ---------------------------------------------------------------------------
 // In-memory job store
@@ -152,7 +166,7 @@ router.get('/:id', (req: Request, res: Response) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
 
-  const base     = BACKEND_URL();
+  const base     = getBackendUrl(req);
   const filePath = path.join(CONVERTED_DIR, `${job.id}.mp3`);
   const fileExists = fs.existsSync(filePath);
 
@@ -167,7 +181,8 @@ router.get('/:id', (req: Request, res: Response) => {
     }
   }
 
-  const downloadUrl = `${base}/downloads/${job.id}.mp3`;
+  const playbackUrl = `${base}/downloads/${job.id}.mp3`;
+  const downloadUrl = `${base}/api/jobs/${job.id}/download`;
 
   const response: any = {
     id:           job.id,
@@ -182,9 +197,9 @@ router.get('/:id', (req: Request, res: Response) => {
   };
 
   if (job.status === 'COMPLETED') {
-    response.s3Url       = downloadUrl;
+    response.s3Url       = playbackUrl;
     response.downloadUrl = downloadUrl;
-    console.log(`[Jobs] Returning COMPLETED for ${job.id} — URL: ${downloadUrl} — fileExists: ${fileExists}`);
+    console.log(`[Jobs] Returning COMPLETED for ${job.id} — URL: ${playbackUrl} — fileExists: ${fileExists}`);
   }
 
   return res.json(response);
