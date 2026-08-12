@@ -56,19 +56,20 @@ export function useConversion() {
 
     setProgress(pct);
 
-    // Always update metadata as soon as it arrives (title/thumbnail come from DISCOVERING)
-    setMetadata(prev => ({
-      ...prev,
-      filename:  data.title || fallbackFilename,
-      title:     data.title     || prev.title,
-      thumbnail: data.thumbnail ?? prev.thumbnail,
-      duration:  data.duration  || prev.duration,
-      fileSize:  data.fileSize  || prev.fileSize,
-    }));
-
     if (mapped === 'completed') {
-      setS3Url(data.s3Url || data.downloadUrl || null);
+      // Build download URL — prefer what server returns, fallback to constructing it
+      const downloadUrl = data.s3Url || data.downloadUrl || null;
+      console.log('[useConversion] COMPLETED. Download URL:', downloadUrl);
+      setS3Url(downloadUrl);
       setProgress(100);
+      setMetadata(prev => ({
+        ...prev,
+        filename:  data.title || prev.filename || 'converted.mp3',
+        title:     data.title    || prev.title,
+        thumbnail: data.thumbnail ?? prev.thumbnail,
+        duration:  data.duration || prev.duration,
+        fileSize:  data.fileSize || prev.fileSize,
+      }));
       setStatus('completed');
       stopPolling();
     } else if (mapped === 'failed') {
@@ -76,6 +77,15 @@ export function useConversion() {
       setStatus('failed');
       stopPolling();
     } else {
+      // Update metadata progressively during processing
+      setMetadata(prev => ({
+        ...prev,
+        filename:  data.title || fallbackFilename,
+        title:     data.title     || prev.title,
+        thumbnail: data.thumbnail ?? prev.thumbnail,
+        duration:  data.duration  || prev.duration,
+        fileSize:  data.fileSize  || prev.fileSize,
+      }));
       setStatus(mapped);
     }
   }, [stopPolling]);

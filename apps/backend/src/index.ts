@@ -17,8 +17,21 @@ app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Serve converted MP3s directly — must match CONVERTED_DIR in pipeline.ts
-app.use('/downloads', express.static('/tmp/shkarko-al/converted'));
+// Serve converted MP3s with explicit CORS so browser <audio> can load them
+app.use('/downloads', (req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range');
+  res.setHeader('Accept-Ranges', 'bytes');
+  next();
+}, express.static('/tmp/shkarko-al/converted', { maxAge: 0 }));
+
+// Also expose under /api/v1/downloads for consistency
+app.use('/api/v1/downloads', (req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Accept-Ranges', 'bytes');
+  next();
+}, express.static('/tmp/shkarko-al/converted', { maxAge: 0 }));
 
 app.get('/', (_req, res) => res.json({ status: 'ok' }));
 app.get('/health', (_req, res) => res.json({ status: 'healthy' }));

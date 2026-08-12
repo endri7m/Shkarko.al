@@ -151,20 +151,24 @@ router.get('/:id', (req: Request, res: Response) => {
 
   const base     = BACKEND_URL();
   const filePath = path.join(CONVERTED_DIR, `${job.id}.mp3`);
+  const fileExists = fs.existsSync(filePath);
 
   // File-system override — if file is there and job not yet marked complete
-  if (job.status !== 'COMPLETED' && job.status !== 'FAILED' && fs.existsSync(filePath)) {
+  if (job.status !== 'COMPLETED' && job.status !== 'FAILED' && fileExists) {
     const size = fs.statSync(filePath).size;
     if (size > 0) {
       job.status   = 'COMPLETED';
       job.progress = 100;
       job.fileSize = size;
+      console.log(`[Jobs] ${job.id} forced COMPLETED via file check (${size} bytes)`);
     }
   }
 
+  const downloadUrl = `${base}/downloads/${job.id}.mp3`;
+
   const response: any = {
     id:           job.id,
-    status:       job.status,
+    status:       job.status,          // always uppercase e.g. 'COMPLETED'
     progress:     job.progress,
     title:        job.title || job.id,
     thumbnail:    job.thumbnail,
@@ -175,11 +179,29 @@ router.get('/:id', (req: Request, res: Response) => {
   };
 
   if (job.status === 'COMPLETED') {
-    response.s3Url      = `${base}/downloads/${job.id}.mp3`;
-    response.downloadUrl = response.s3Url;
+    response.s3Url       = downloadUrl;
+    response.downloadUrl = downloadUrl;
+    console.log(`[Jobs] Returning COMPLETED for ${job.id} — URL: ${downloadUrl} — fileExists: ${fileExists}`);
   }
 
   return res.json(response);
+});
+
+// ---------------------------------------------------------------------------
+// GET /:id/download — direct binary download fallback
+// ---------------------------------------------------------------------------
+router.get('/:id/download', (req: Request, res: Response) => {
+  const jobId   = req.params.id;
+  const filePath = path.join(CONVERTED_DIR, `${jobId}.mp3`);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'File not found or expired' });
+  }
+
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'audio/mpeg');
+  res.setHeader('Content-Disposition', `attachment; filename="${jobId}.mp3"`);
+  return res.sendFile(filePath);
 });
 
 // ---------------------------------------------------------------------------
