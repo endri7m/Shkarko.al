@@ -198,28 +198,35 @@ router.get('/:id', (req: Request, res: Response) => {
 
   if (job.status === 'COMPLETED') {
     response.s3Url       = playbackUrl;
-    response.downloadUrl = downloadUrl;
-    console.log(`[Jobs] Returning COMPLETED for ${job.id} — URL: ${playbackUrl} — fileExists: ${fileExists}`);
+    response.downloadUrl = downloadUrl;  // used by download button (triggers filename dialog)
+    console.log(`[Jobs] COMPLETED ${job.id} — play: ${playbackUrl} | download: ${downloadUrl} — fileExists: ${fileExists}`);
   }
 
   return res.json(response);
 });
 
 // ---------------------------------------------------------------------------
-// GET /:id/download — direct binary download fallback
+// GET /:id/download — forced browser download dialog
 // ---------------------------------------------------------------------------
 router.get('/:id/download', (req: Request, res: Response) => {
-  const jobId   = req.params.id;
+  const jobId    = req.params.id;
   const filePath = path.join(CONVERTED_DIR, `${jobId}.mp3`);
 
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({ error: 'File not found or expired' });
   }
 
+  const job      = jobs.get(jobId);
+  const rawTitle = job?.title || jobId;
+  // Sanitize title for use as filename
+  const safeName = rawTitle.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || jobId;
+  const fileName = `${safeName}.mp3`;
+
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'audio/mpeg');
-  res.setHeader('Content-Disposition', `attachment; filename="${jobId}.mp3"`);
-  return res.sendFile(filePath);
+  res.setHeader('Accept-Ranges', 'bytes');
+  // res.download sets Content-Disposition: attachment
+  return res.download(filePath, fileName);
 });
 
 // ---------------------------------------------------------------------------
