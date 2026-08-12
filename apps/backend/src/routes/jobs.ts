@@ -7,6 +7,18 @@ import { discoverVideo, downloadAudio, convertToMp3, CONVERTED_DIR, RAW_DIR } fr
 const router = Router();
 
 export function getBackendUrl(req: Request): string {
+  const forwardedProtocol = req.get('x-forwarded-proto')?.split(',')[0].trim();
+  const forwardedHost = req.get('x-forwarded-host')?.split(',')[0].trim();
+  const requestProtocol = forwardedProtocol || req.protocol;
+  const requestHost = forwardedHost || req.get('host');
+
+  // In production, the request host is authoritative. This prevents a stale or
+  // incorrect BACKEND_URL (for example, the frontend domain) from producing
+  // media links that point at a service where the MP3 does not exist.
+  if (requestHost && !/^(localhost|127\.0\.0\.1)(:|$)/i.test(requestHost)) {
+    return `${requestProtocol}://${requestHost}`;
+  }
+
   const configuredUrl = process.env.BACKEND_URL?.trim().replace(/\/$/, '');
   if (configuredUrl) {
     return /^https?:\/\//i.test(configuredUrl)
@@ -14,11 +26,8 @@ export function getBackendUrl(req: Request): string {
       : `https://${configuredUrl}`;
   }
 
-  const forwardedProtocol = req.get('x-forwarded-proto')?.split(',')[0].trim();
-  const forwardedHost = req.get('x-forwarded-host')?.split(',')[0].trim();
-  const protocol = forwardedProtocol || req.protocol;
-  const host = forwardedHost || req.get('host') || `localhost:${process.env.PORT || 5000}`;
-  return `${protocol}://${host}`;
+  const host = requestHost || `localhost:${process.env.PORT || 5000}`;
+  return `${requestProtocol}://${host}`;
 }
 
 // ---------------------------------------------------------------------------
