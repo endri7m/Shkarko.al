@@ -17,6 +17,7 @@ export default function Home() {
     progress,
     errorMessage,
     s3Url,
+    downloadUrl,
     metadata,
     convertUrl,
     reset,
@@ -176,6 +177,7 @@ export default function Home() {
               >
                 <Player
                   s3Url={s3Url}
+                  downloadUrl={downloadUrl || s3Url}
                   filename={metadata.filename || 'converted.mp3'}
                   duration={metadata.duration || 0}
                   fileSize={metadata.fileSize || 0}
